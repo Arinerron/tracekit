@@ -1,0 +1,18 @@
+[package]
+name = "wire"
+description = "Single-sourced kernel/user ABI types for eBPF tools, with generated C headers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+# C header generation (`HeaderBuilder`); enabled by build scripts.
+std = []
+
+[dev-dependencies]
+# Tests and doctests exercise header generation.
+wire = { path = ".", features = ["std"] }
+
+[lints]
+workspace = true

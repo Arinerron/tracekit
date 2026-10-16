@@ -1,0 +1,12 @@
+Name:	sleep
+Umask:	0022
+State:	Z (zombie)
+Tgid:	1500
+Ngid:	0
+Pid:	1500
+PPid:	1300
+TracerPid:	0
+Uid:	1000	1000	1000	1000
+Gid:	1000	1000	1000	1000
+FDSize:	64
+Threads:	1

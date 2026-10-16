@@ -1,0 +1,22 @@
+[package]
+name = "bpfdoctor"
+description = "Preflight and doctor checks for BPF tracing tools: detects missing configuration and prints the exact fix."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+# Exposes `FixtureEnv` so tools can test their own checks against fixture trees.
+testing = []
+
+[dependencies]
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+bpfdoctor = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

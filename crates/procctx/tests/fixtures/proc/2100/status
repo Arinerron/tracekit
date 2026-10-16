@@ -1,0 +1,12 @@
+Name:	build-script-bu
+Umask:	0022
+State:	R (running)
+Tgid:	2100
+Ngid:	0
+Pid:	2100
+PPid:	1300
+TracerPid:	0
+Uid:	1000	1000	1000	1000
+Gid:	1000	1000	1000	1000
+FDSize:	64
+Threads:	1

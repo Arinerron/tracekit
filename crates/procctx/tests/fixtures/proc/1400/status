@@ -1,0 +1,12 @@
+Name:	make
+Umask:	0022
+State:	S (sleeping)
+Tgid:	1400
+Ngid:	0
+Pid:	1400
+PPid:	1300
+TracerPid:	0
+Uid:	1000	1000	1000	1000
+Gid:	1000	1000	1000	1000
+FDSize:	64
+Threads:	1

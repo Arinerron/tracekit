@@ -1,0 +1,12 @@
+Name:	sh
+Umask:	0022
+State:	S (sleeping)
+Tgid:	1410
+Ngid:	0
+Pid:	1410
+PPid:	1400
+TracerPid:	0
+Uid:	1000	1000	1000	1000
+Gid:	1000	1000	1000	1000
+FDSize:	64
+Threads:	1

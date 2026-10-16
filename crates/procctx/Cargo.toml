@@ -1,0 +1,18 @@
+[package]
+name = "procctx"
+description = "Process context for eBPF tools: ancestry, systemd/container/tmux context and build-origin attribution from events and /proc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+# `testing::FixtureSource`: a fault-injecting `ProcSource` over a fixture tree.
+testing = []
+
+[dev-dependencies]
+# Integration tests drive the table through `testing::FixtureSource`.
+procctx = { path = ".", features = ["testing"] }
+
+[lints]
+workspace = true

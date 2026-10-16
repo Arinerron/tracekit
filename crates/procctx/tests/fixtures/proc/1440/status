@@ -1,0 +1,12 @@
+Name:	evil) (x
+Umask:	0022
+State:	S (sleeping)
+Tgid:	1440
+Ngid:	0
+Pid:	1440
+PPid:	1430
+TracerPid:	0
+Uid:	1000	1000	1000	1000
+Gid:	1000	1000	1000	1000
+FDSize:	64
+Threads:	1
