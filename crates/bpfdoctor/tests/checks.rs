@@ -458,7 +458,7 @@ fn file_caps_name_why_they_are_not_in_effect() {
         unexplained.observed,
         "file capabilities on /usr/local/bin/whytime are not in effect"
     );
-    assert!(unexplained.fixes.is_empty());
+    assert_eq!(unexplained.fixes, []);
 }
 
 #[test]
@@ -921,7 +921,7 @@ fn seccomp_does_not_blame_eperm_inside_user_namespace() {
     let diag = run(&rootless, "env.seccomp");
     assert_eq!(diag.status, Status::Info);
     assert_eq!(diag.observed, "seccomp filter active (mode 2)");
-    assert!(diag.fixes.is_empty());
+    assert_eq!(diag.fixes, []);
     assert_eq!(run(&rootless, "env.userns").status, Status::Fail);
 }
 
@@ -972,7 +972,7 @@ fn hidepid_has_no_effect_with_sys_ptrace() {
         "fs.proc_hidepid",
     );
     assert_eq!(root.status, Status::Info);
-    assert!(root.fixes.is_empty());
+    assert_eq!(root.fixes, []);
     let ptrace = unprivileged()
         .with_caps(caps(Cap::SysPtrace.mask()))
         .with_file("/proc/self/mountinfo", HIDEPID_MOUNTINFO);
