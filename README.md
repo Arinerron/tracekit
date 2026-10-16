@@ -12,16 +12,16 @@ Each crate's rustdoc has a worked example.
 
 ## Usage
 
-The crates are not on crates.io. Depend on them through git, pinned to a release tag:
+The crates are on crates.io:
 
 ```toml
 [dependencies]
-tracekit-wire = { git = "https://github.com/Arinerron/tracekit", tag = "v0.1.0" }
-procctx = { git = "https://github.com/Arinerron/tracekit", tag = "v0.1.0" }
-bpfdoctor = { git = "https://github.com/Arinerron/tracekit", tag = "v0.1.0" }
+tracekit-wire = "0.1"
+procctx = "0.1"
+bpfdoctor = "0.1"
 
 [build-dependencies]
-tracekit-wire = { git = "https://github.com/Arinerron/tracekit", tag = "v0.1.0", features = ["std"] }
+tracekit-wire = { version = "0.1", features = ["std"] }
 ```
 
 ## Requirements

@@ -4,4 +4,4 @@ All notable changes to the tracekit crates are recorded here. The project follow
 
 ## 0.1.0 - 2026-10-16
 
-First release of `tracekit-wire`, `procctx` and `bpfdoctor`, distributed through git tags rather than crates.io.
+First release of `tracekit-wire`, `procctx` and `bpfdoctor`, published on crates.io.
