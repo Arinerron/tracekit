@@ -10,6 +10,20 @@ Shared Rust crates for eBPF tracing tools on Linux.
 
 Each crate's rustdoc has a worked example.
 
+## Usage
+
+The crates are not on crates.io. Depend on them through git, pinned to a release tag:
+
+```toml
+[dependencies]
+tracekit-wire = { git = "https://github.com/Arinerron/tracekit", tag = "v0.1.0" }
+procctx = { git = "https://github.com/Arinerron/tracekit", tag = "v0.1.0" }
+bpfdoctor = { git = "https://github.com/Arinerron/tracekit", tag = "v0.1.0" }
+
+[build-dependencies]
+tracekit-wire = { git = "https://github.com/Arinerron/tracekit", tag = "v0.1.0", features = ["std"] }
+```
+
 ## Requirements
 
 - Linux (`procctx` and `bpfdoctor` read `/proc` and `/sys`).
