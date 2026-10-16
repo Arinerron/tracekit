@@ -167,13 +167,14 @@ const AT_CLKTCK: usize = 17;
 
 /// `AT_CLKTCK` from an auxiliary vector (native-endian `usize` key/value pairs).
 fn parse_auxv_clktck(auxv: &[u8]) -> Option<NonZeroU64> {
-    const WORD: usize = size_of::<usize>();
-    let word = |bytes: &[u8]| <[u8; WORD]>::try_from(bytes).ok().map(usize::from_ne_bytes);
-    auxv.chunks_exact(2 * WORD)
-        .map(|pair| (word(&pair[..WORD]), word(&pair[WORD..])))
-        .take_while(|&(key, _)| key != Some(AT_NULL))
-        .find(|&(key, _)| key == Some(AT_CLKTCK))
-        .and_then(|(_, hz)| NonZeroU64::new(u64::try_from(hz?).ok()?))
+    let (words, _) = auxv.as_chunks::<{ size_of::<usize>() }>();
+    let (pairs, _) = words.as_chunks::<2>();
+    pairs
+        .iter()
+        .map(|[key, value]| (usize::from_ne_bytes(*key), usize::from_ne_bytes(*value)))
+        .take_while(|&(key, _)| key != AT_NULL)
+        .find(|&(key, _)| key == AT_CLKTCK)
+        .and_then(|(_, hz)| NonZeroU64::new(u64::try_from(hz).ok()?))
 }
 
 /// Read access to process state. [`ProcFs`] is the real implementation; tests can

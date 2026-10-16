@@ -227,12 +227,11 @@ fn container_at(parent: &str, part: &str) -> Option<Container> {
         (Runtime::CriO, id)
     } else if let Some(name) = part.strip_prefix("lxc.payload.").filter(|n| !n.is_empty()) {
         (Runtime::Lxc, name)
-    } else if let Some(name) = named(part, "machine-", ".scope").or_else(|| {
-        named(part, "systemd-nspawn@", ".service").filter(|_| parent == "machine.slice")
-    }) {
-        (Runtime::Nspawn, name)
     } else {
-        return None;
+        let name = named(part, "machine-", ".scope").or_else(|| {
+            named(part, "systemd-nspawn@", ".service").filter(|_| parent == "machine.slice")
+        })?;
+        (Runtime::Nspawn, name)
     };
     Some(Container {
         runtime,
