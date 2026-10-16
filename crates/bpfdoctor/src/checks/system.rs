@@ -4,7 +4,7 @@ use std::path::Path;
 
 use super::{
     MEMCG_KERNEL, Shared, errno_label, kernel_at_least, memcg_accounting, privileged, read_text,
-    sudo_tool,
+    setcap_fix, sudo_tool,
 };
 use crate::{BpfProbe, Cap, Diagnostic, Env, Fix, Status, Tool};
 
@@ -49,9 +49,11 @@ pub(super) fn memlock(check: &Shared, env: &dyn Env, tool: &Tool) -> Diagnostic 
             ),
         )
         .with_impact(format!("BPF map creation fails with EPERM; {} cannot run", tool.name))
-        .with_fix(Fix::new(
-            tool.setcap_command(&[Cap::SysResource], &tool.exe),
-            format!("lets {} raise its own limit", tool.name),
+        .with_fix(setcap_fix(
+            env,
+            tool,
+            &[Cap::SysResource],
+            &format!("lets {} raise its own limit", tool.name),
         ))
         .with_fix(Fix::new(
             "sudo prlimit --memlock=unlimited:unlimited --pid $$",
@@ -98,16 +100,23 @@ pub(super) fn proc_hidepid(check: &Shared, env: &dyn Env, tool: &Tool) -> Diagno
     let Some(mountinfo) = read_text(env, MOUNTINFO) else {
         return check.diag(Status::Skip, format!("{MOUNTINFO} not readable"));
     };
-    match hidepid(&mountinfo) {
-        None => check.diag(Status::Pass, "/proc mounted without hidepid"),
-        Some(level) => check
-            .diag(Status::Warn, format!("/proc mounted with hidepid={level}"))
-            .with_impact(format!(
-                "other users' processes are hidden from /proc; {} cannot name them",
-                tool.name
-            ))
-            .with_fix(Fix::new(sudo_tool(tool), "root sees every process")),
+    let Some(level) = hidepid(&mountinfo) else {
+        return check.diag(Status::Pass, "/proc mounted without hidepid");
+    };
+    // hidepid falls back to a ptrace access check, which CAP_SYS_PTRACE passes.
+    if Cap::SysPtrace.granted_by(env.caps().effective) {
+        return check.diag(
+            Status::Info,
+            format!("/proc mounted with hidepid={level}; no effect with CAP_SYS_PTRACE"),
+        );
     }
+    check
+        .diag(Status::Warn, format!("/proc mounted with hidepid={level}"))
+        .with_impact(format!(
+            "other users' processes are hidden from /proc; {} cannot name them",
+            tool.name
+        ))
+        .with_fix(Fix::new(sudo_tool(tool), "root sees every process"))
 }
 
 /// The active `hidepid=` level of the topmost proc mount on `/proc`, unless off.

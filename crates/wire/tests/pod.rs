@@ -1,6 +1,6 @@
 //! Zero-copy and copying decoding of wire types.
 
-use wire::{as_bytes, from_bytes, read, wire};
+use tracekit_wire::{as_bytes, from_bytes, read, wire};
 
 wire! {
     pub struct Sample {

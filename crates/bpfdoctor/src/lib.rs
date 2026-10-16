@@ -36,7 +36,7 @@ mod tool;
 
 pub use cap::Cap;
 pub use doctor::{Check, Doctor, Report};
-pub use env::{BpfProbe, CapSets, Env, Ids, MountFlags, Uname};
+pub use env::{BpfProbe, CapSets, Env, FileCaps, Ids, MountFlags, Uname};
 pub use errno::{errno_name, ids_for_errno};
 #[cfg(feature = "testing")]
 pub use fixture::FixtureEnv;

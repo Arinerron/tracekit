@@ -12,6 +12,7 @@ use crate::{Pid, ProcError};
 
 /// Per-process files a [`ProcSource`] can read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ProcFile {
     /// `cmdline`: NUL-separated arguments.
     Cmdline,
@@ -40,6 +41,7 @@ impl ProcFile {
 
 /// Per-process symlinks a [`ProcSource`] can resolve.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ProcLink {
     /// `exe`: the executable.
     Exe,
@@ -210,9 +212,10 @@ struct CgroupIndex {
 }
 
 impl ProcFs {
-    /// The host's `/proc` and `/sys/fs/cgroup`.
+    /// The host's `/proc` and cgroup2 mount: `/sys/fs/cgroup`, or on hybrid hosts
+    /// (cgroup v1 controllers at `/sys/fs/cgroup`) `/sys/fs/cgroup/unified`.
     pub fn new() -> Self {
-        Self::with_roots("/proc", "/sys/fs/cgroup")
+        Self::with_roots("/proc", cgroup2_mount(Path::new("/sys/fs/cgroup")))
     }
 
     /// A procfs and cgroup2 tree mounted elsewhere, or fixtures laid out the same way.
@@ -307,13 +310,27 @@ impl ProcSource for ProcFs {
     }
 }
 
+/// The cgroup2 mount under `base`: `base` itself (unified hierarchy), or
+/// `base/unified` when only that holds cgroup2's `cgroup.controllers` (systemd's
+/// hybrid layout, with v1 controllers mounted beside it).
+fn cgroup2_mount(base: &Path) -> PathBuf {
+    let unified = base.join("unified");
+    if !base.join("cgroup.controllers").exists() && unified.join("cgroup.controllers").exists() {
+        unified
+    } else {
+        base.to_path_buf()
+    }
+}
+
 /// Maps every directory inode below `root` to its path relative to `root`.
-/// Unreadable or vanishing subtrees are skipped.
+/// Unreadable or vanishing subtrees are skipped, and so are other filesystems
+/// mounted below `root` (their inodes number a different hierarchy).
 fn walk_cgroups(root: &Path) -> HashMap<u64, Box<str>> {
     let mut paths = HashMap::new();
     let Ok(meta) = fs::metadata(root) else {
         return paths;
     };
+    let dev = meta.dev();
     paths.insert(meta.ino(), Box::from("/"));
     let mut pending = vec![(root.to_path_buf(), String::new())];
     while let Some((dir, rel)) = pending.pop() {
@@ -328,6 +345,9 @@ fn walk_cgroups(root: &Path) -> HashMap<u64, Box<str>> {
             let Ok(meta) = entry.metadata() else {
                 continue;
             };
+            if meta.dev() != dev {
+                continue;
+            }
             let child = format!("{rel}/{}", entry.file_name().to_string_lossy());
             paths.insert(meta.ino(), Box::from(child.as_str()));
             pending.push((entry.path(), child));
@@ -338,10 +358,12 @@ fn walk_cgroups(root: &Path) -> HashMap<u64, Box<str>> {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU64;
+    use std::{num::NonZeroU64, os::unix::fs::MetadataExt, path::Path};
 
-    use super::{StatLine, parse_auxv_clktck, parse_status_ids};
+    use super::{StatLine, cgroup2_mount, parse_auxv_clktck, parse_status_ids, walk_cgroups};
     use crate::ProcError;
+
+    const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
 
     const TAIL: &str = "4194560 1200 0 3 0 5 3 0 0 20 0 1 0 6105 12345678 900 18446744073709551615";
 
@@ -441,5 +463,38 @@ mod tests {
             .flat_map(|w: &usize| w.to_ne_bytes())
             .collect();
         assert_eq!(parse_auxv_clktck(&auxv), None);
+    }
+
+    #[test]
+    fn hybrid_hosts_use_the_unified_mount() {
+        let unified = Path::new(FIXTURES).join("cgroup");
+        assert_eq!(cgroup2_mount(&unified), unified);
+        let hybrid = Path::new(FIXTURES).join("cgroup-hybrid");
+        assert_eq!(cgroup2_mount(&hybrid), hybrid.join("unified"));
+        // Neither layout: keep the given path.
+        let none = Path::new(FIXTURES).join("proc");
+        assert_eq!(cgroup2_mount(&none), none);
+    }
+
+    #[test]
+    fn cgroup_walk_stays_on_one_filesystem() {
+        // /dev/pts and /dev/shm are separate mounts on Linux hosts and containers.
+        let root = Path::new("/dev");
+        let Ok(dev) = std::fs::metadata(root).map(|meta| meta.dev()) else {
+            return;
+        };
+        let mounts: Vec<&str> = ["/pts", "/shm", "/mqueue"]
+            .into_iter()
+            .filter(|sub| {
+                std::fs::metadata(format!("/dev{sub}")).is_ok_and(|meta| meta.dev() != dev)
+            })
+            .collect();
+        let paths = walk_cgroups(root);
+        for sub in mounts {
+            assert!(
+                paths.values().all(|path| !path.starts_with(sub)),
+                "walked into {sub}"
+            );
+        }
     }
 }

@@ -615,6 +615,49 @@ fn zombie_exit_status_survives_rescans() {
 }
 
 #[test]
+fn zombie_known_only_by_its_exit_is_read_from_proc() {
+    let mut t = table();
+    exit(&mut t, 20, key(1500, 6200), 0);
+    t.enrich(1500).unwrap();
+    let info = t.get(1500).unwrap();
+    assert_eq!(
+        (&*info.comm, info.ppid, info.exit.and_then(|exit| exit.code)),
+        ("sleep", Some(1300), Some(0))
+    );
+    assert_eq!(t.len(), 1);
+}
+
+#[test]
+fn exit_recorded_before_proc_shows_a_zombie() {
+    // The exit event fires while /proc still shows 1440 running.
+    let mut t = table();
+    exit(&mut t, 20, key(1440, 6105), 0);
+    let chain = t.ancestry(1440, Stop::Depth(0));
+    assert_eq!(keys(&chain), [key(1440, 6105)]);
+    let exited = Some(ExitInfo {
+        ts_ns: 20,
+        code: Some(0),
+    });
+    assert_eq!(
+        (&*chain.chain[0].comm, chain.chain[0].exit),
+        ("evil) (x", exited)
+    );
+    assert_eq!(t.len(), 1);
+    exec(&mut t, 30, key(1440, 9000), "next");
+    assert_eq!(t.get_key(key(1440, 6105)).unwrap().exit, exited);
+
+    let ticks_per_sec = NonZeroU64::new(100).unwrap();
+    let mut t = with_config(Config {
+        start_clock: StartClock::BootNs { ticks_per_sec },
+        ..Config::default()
+    });
+    exit(&mut t, 20, key(1440, 61_057_123_456), 0);
+    t.enrich(1440).unwrap();
+    assert_eq!(t.get(1440).unwrap().exit, exited);
+    assert_eq!(t.len(), 1);
+}
+
+#[test]
 fn boot_ns_keys_match_proc_ticks() {
     let ticks_per_sec = NonZeroU64::new(100).unwrap();
     let mut t = with_config(Config {
@@ -628,6 +671,143 @@ fn boot_ns_keys_match_proc_ticks() {
     // /proc-loaded ancestors get keys in the same clock and order correctly.
     let chain = t.ancestry(1440, Stop::At(1430));
     assert_eq!(keys(&chain), [key(1440, start), key(1430, 61_000_000_000)]);
+}
+
+#[test]
+fn boot_ns_events_match_proc_records() {
+    let ticks_per_sec = NonZeroU64::new(100).unwrap();
+    let mut t = with_config(Config {
+        start_clock: StartClock::BootNs { ticks_per_sec },
+        ..Config::default()
+    });
+    t.snapshot_all().unwrap();
+    let len = t.len();
+    // /proc says 1430 started at tick 6100; its exec event has the precise start.
+    let sh = key(1430, 61_004_000_000);
+    exec(&mut t, 10, sh, "node");
+    let info = t.get(1430).unwrap();
+    assert_eq!(
+        (info.key, &*info.comm, info.ppid, info.exit),
+        (sh, "node", Some(1420), None)
+    );
+    // 1440 (tick 6105) is known only from /proc.
+    let node = key(1440, 61_057_123_456);
+    assert_eq!(t.get_key(node).unwrap().key, key(1440, 61_050_000_000));
+    fork(&mut t, 5, 1430, node);
+    exit(&mut t, 20, node, 0);
+    let info = t.get(1440).unwrap();
+    assert_eq!(
+        (info.key, info.fork_ts_ns, info.exit),
+        (
+            node,
+            Some(5),
+            Some(ExitInfo {
+                ts_ns: 20,
+                code: Some(0)
+            })
+        )
+    );
+    // The rounded key still finds the record.
+    assert_eq!(t.get_key(key(1440, 61_050_000_000)).unwrap().key, node);
+    assert_eq!(t.len(), len);
+}
+
+#[test]
+fn exit_before_fork_or_exec_stays_dead() {
+    let mut t = table();
+    exec_shell(&mut t, 1, key(10_050, 1), "sh");
+    exit(&mut t, 10, key(10_700, 5), 0);
+    fork(&mut t, 8, 10_050, key(10_700, 5));
+    let info = t.get(10_700).unwrap();
+    assert_eq!(
+        info.exit,
+        Some(ExitInfo {
+            ts_ns: 10,
+            code: Some(0)
+        })
+    );
+    // Only the exit was known, so the fork fills in the inherited fields.
+    assert_eq!(
+        (&*info.comm, info.ppid, info.fork_ts_ns),
+        ("sh", Some(10_050), Some(8))
+    );
+    t.expire(10 + Config::default().tombstone_ttl_ns + 1);
+    assert!(t.get(10_700).is_none());
+    assert_eq!(t.len(), 1);
+
+    fork(&mut t, 20, 10_050, key(10_701, 5));
+    exit(&mut t, 40, key(10_701, 5), 7);
+    exec(&mut t, 30, key(10_701, 5), "cc");
+    let info = t.get_key(key(10_701, 5)).unwrap();
+    assert_eq!(
+        (&*info.comm, info.exit.and_then(|exit| exit.code)),
+        ("cc", Some(7))
+    );
+    assert_eq!(t.len(), 2);
+    // A new process on the pid leaves the real exit status alone.
+    exec(&mut t, 50, key(10_701, 9), "new");
+    assert_eq!(
+        t.get_key(key(10_701, 5)).unwrap().exit,
+        Some(ExitInfo {
+            ts_ns: 40,
+            code: Some(7)
+        })
+    );
+    assert_eq!(t.get(10_701).unwrap().key, key(10_701, 9));
+}
+
+#[test]
+fn late_events_of_an_older_lifetime_spare_the_live_process() {
+    let mut t = table();
+    exec_shell(&mut t, 1, key(10_050, 1), "sh");
+    fork(&mut t, 10, 10_050, key(10_900, 5));
+    exit(&mut t, 15, key(10_900, 5), 0);
+    fork(&mut t, 18, 10_050, key(10_900, 9));
+    // A late exec of the exited process updates its tombstone.
+    exec(&mut t, 12, key(10_900, 5), "old");
+    let old = t.get_key(key(10_900, 5)).unwrap();
+    assert_eq!(
+        (&*old.comm, old.exit.and_then(|exit| exit.code)),
+        ("old", Some(0))
+    );
+    // Late events of a lifetime the table never held are dropped.
+    fork(&mut t, 3, 10_050, key(10_900, 2));
+    exec(&mut t, 4, key(10_900, 2), "older");
+    assert!(t.get_key(key(10_900, 2)).is_none());
+    let new = t.get(10_900).unwrap();
+    assert_eq!((new.key, new.exit), (key(10_900, 9), None));
+    exit(&mut t, 30, key(10_900, 9), 1);
+    assert_eq!(
+        t.get_key(key(10_900, 9)).unwrap().exit,
+        Some(ExitInfo {
+            ts_ns: 30,
+            code: Some(1)
+        })
+    );
+}
+
+#[test]
+fn exec_keeps_the_fork_time_parent() {
+    let mut t = table();
+    exec_shell(&mut t, 1, key(11_000, 10), "make");
+    fork(&mut t, 20, 11_000, key(11_001, 20));
+    exec(&mut t, 21, key(11_001, 20), "sh");
+    fork(&mut t, 30, 11_001, key(11_002, 30));
+    exit(&mut t, 40, key(11_001, 20), 0);
+    // By exec time the child has been re-parented to init.
+    let reparented = |ts_ns, key| ExecEvent {
+        ppid: Some(1),
+        comm: Some(b"daemon".as_slice()),
+        ..ExecEvent::new(ts_ns, key)
+    };
+    t.on_exec(reparented(50, key(11_002, 30)));
+    let chain = t.ancestry(11_002, Stop::Root);
+    assert_eq!(pids(&chain), [11_002, 11_001, 11_000, 1]);
+
+    // Also when the exec overtakes the fork.
+    t.on_exec(reparented(50, key(11_003, 40)));
+    fork(&mut t, 35, 11_001, key(11_003, 40));
+    assert_eq!(t.get(11_003).unwrap().ppid, Some(11_001));
 }
 
 #[test]

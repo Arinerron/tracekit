@@ -8,7 +8,9 @@ use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
-use crate::env::{BpfProbe, CapSets, Env, Ids, MountFlags, Uname, decode_vfs_cap, status_field};
+use crate::env::{
+    BpfProbe, CapSets, Env, FileCaps, Ids, MountFlags, Uname, decode_vfs_cap, status_field,
+};
 
 /// The running system.
 #[derive(Clone, Copy, Debug, Default)]
@@ -68,7 +70,7 @@ impl Env for RealEnv {
         }
     }
 
-    fn file_caps(&self, path: &Path) -> Option<u64> {
+    fn file_caps(&self, path: &Path) -> Option<FileCaps> {
         let path = CString::new(path.as_os_str().as_bytes()).ok()?;
         // Large enough for `vfs_ns_cap_data`, the biggest revision.
         let mut buf = [0u8; 24];
@@ -124,8 +126,20 @@ impl Env for RealEnv {
         if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &raw mut limit) } != 0 {
             return (0, 0);
         }
-        // `RLIM_INFINITY` is `u64::MAX` on Linux.
-        (limit.rlim_cur, limit.rlim_max)
+        // `rlim_t` is only 32 bits wide on 32-bit targets, where `RLIM_INFINITY`
+        // is `u32::MAX`; map it to `u64::MAX` explicitly.
+        #[allow(
+            clippy::useless_conversion,
+            reason = "rlim_t is u64 on 64-bit targets but u32 on 32-bit ones"
+        )]
+        let widen = |value: libc::rlim_t| {
+            if value == libc::RLIM_INFINITY {
+                u64::MAX
+            } else {
+                u64::from(value)
+            }
+        };
+        (widen(limit.rlim_cur), widen(limit.rlim_max))
     }
 
     fn env_var(&self, key: &str) -> Option<String> {

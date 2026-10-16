@@ -24,6 +24,7 @@ pub struct Origin {
 
 /// Kinds of [`Origin`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum OriginKind {
     /// An npm lifecycle script (also the default for unknown user agents).
     NpmLifecycle,
@@ -43,6 +44,7 @@ pub enum OriginKind {
 
 /// Strength of an [`Origin`] classification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Confidence {
     /// Direct, specific evidence (the variables the tool itself exports).
     High,
@@ -59,10 +61,12 @@ pub enum Confidence {
 /// rank as follows:
 /// 1. Cargo build script: `CARGO_PKG_NAME` and `OUT_DIR` are set, and the exe or
 ///    `argv[0]` basename starts with `build-script-`.
-/// 2. pip: an argument mentions `setup.py`.
+/// 2. pip: a Python interpreter runs `setup.py` (an argument whose basename is
+///    `setup.py`, or pip's `-c` shim quoting such a path).
 /// 3. npm-style lifecycle: `npm_lifecycle_event`, with the kind taken from
 ///    `npm_config_user_agent`. When the package name is missing, a cwd below
-///    `node_modules/<pkg>` names the package.
+///    `node_modules/<pkg>` names the package. If the environment was not captured,
+///    that cwd alone is enough.
 /// 4. pip: `PIP_BUILD_TRACKER` is set.
 ///
 /// The rules that look at the process's own exe and arguments come before
@@ -133,13 +137,33 @@ fn pip(info: &ProcInfo, item: Box<str>) -> Origin {
     }
 }
 
-/// `python setup.py ...`, or pip's `python -c "...setup.py..."` shim.
+fn is_python(argv0: &OsStr) -> bool {
+    let base = Path::new(argv0)
+        .file_name()
+        .map_or(&[][..], OsStr::as_bytes);
+    base.starts_with(b"python") || base.starts_with(b"pypy")
+}
+
+/// Whether `code` holds a string literal naming a `setup.py` file, as pip's `-c`
+/// shim does (`__file__ = '/tmp/pip-install-x/pkg/setup.py'`).
+fn quotes_setup_py(code: &[u8]) -> bool {
+    code.windows(10).any(|w| {
+        matches!(w[0], b'/' | b'\'' | b'"')
+            && &w[1..9] == b"setup.py"
+            && matches!(w[9], b'\'' | b'"')
+    })
+}
+
+/// A Python interpreter running `setup.py`: `python setup.py ...`, or pip's
+/// `python -c "...'/tmp/.../setup.py'..."` shim.
 fn pip_setup_py(info: &ProcInfo) -> Option<Origin> {
-    let mentioned = info
-        .argv
-        .iter()
-        .any(|arg| arg.as_bytes().windows(8).any(|w| w == b"setup.py"));
-    mentioned.then(|| pip(info, evidence("argv", "setup.py", info.key.pid)))
+    let (argv0, args) = info.argv.split_first()?;
+    let runs = is_python(argv0)
+        && args.iter().any(|arg| {
+            Path::new(arg).file_name() == Some(OsStr::new("setup.py"))
+                || quotes_setup_py(arg.as_bytes())
+        });
+    runs.then(|| pip(info, evidence("argv", "setup.py", info.key.pid)))
 }
 
 fn pip_build_tracker(info: &ProcInfo) -> Option<Origin> {
@@ -187,7 +211,13 @@ fn package_script(info: &ProcInfo) -> Option<Origin> {
         found.push(evidence("env", "npm_package_name", pid));
         let version = env.and_then(|env| env.npm_package_version.clone());
         (Some(name.clone()), version, Confidence::High)
-    } else if let Some(package) = info.cwd.as_deref().and_then(node_modules_package) {
+    } else if let Some(package) = info
+        .cwd
+        .as_deref()
+        // A captured environment without the event shows this is no lifecycle script.
+        .filter(|_| event.is_some() || info.env.is_none())
+        .and_then(node_modules_package)
+    {
         found.push(evidence("cwd", &format!("node_modules/{package}"), pid));
         if event.is_some() {
             found.push(evidence("env", "npm_lifecycle_event", pid));
@@ -437,6 +467,16 @@ MAKELEVEL=1\0";
     }
 
     #[test]
+    fn node_modules_cwd_needs_an_unknown_env_or_an_event() {
+        // A shell that cd'd into a dependency: its environment shows no npm script.
+        let git = with_cwd(
+            with_argv(process(7, Some(b"PATH=/usr/bin\0")), &["git", "status"]),
+            "/home/u/proj/node_modules/lodash",
+        );
+        assert_eq!(classify(vec![git]), None);
+    }
+
+    #[test]
     fn package_name_from_env_beats_cwd() {
         let script = with_cwd(process(9, Some(NPM_SCRIPT)), "/p/node_modules/other");
         let origin = classify(vec![script]).unwrap();
@@ -540,6 +580,38 @@ MAKELEVEL=1\0";
             origin.evidence,
             vec![Box::<str>::from("env:PIP_BUILD_TRACKER@6")]
         );
+    }
+
+    #[test]
+    fn setup_py_must_be_run_by_python() {
+        let pip_build = |args: &[&str]| {
+            classify(vec![with_argv(process(6, None), args)]).map(|origin| origin.kind)
+        };
+        for args in [
+            &["python3", "./pkg/setup.py", "build"][..],
+            &[
+                "/venv/bin/python3.12",
+                "/tmp/pip-req-build-x/setup.py",
+                "egg_info",
+            ],
+            &[
+                "python",
+                "-u",
+                "-c",
+                "import setuptools, tokenize;__file__='/tmp/pip-req-build-x/setup.py'",
+            ],
+        ] {
+            assert_eq!(pip_build(args), Some(OriginKind::PipBuild), "{args:?}");
+        }
+        for args in [
+            &["vim", "tests/test_setup.py"][..],
+            &["git", "add", "setup.py"],
+            &["python3", "mysetup.py"],
+            &["python3", "setup.pyc"],
+            &["python3", "-c", "print('test_setup.py')"],
+        ] {
+            assert_eq!(pip_build(args), None, "{args:?}");
+        }
     }
 
     #[test]

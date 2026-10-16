@@ -27,6 +27,7 @@ pub struct ConstDesc {
 /// safely inside expressions. The minimum of each signed type is written as `(-MAX - 1)` because
 /// its magnitude does not fit the type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ConstValue {
     /// A `u8` constant.
     U8(u8),

@@ -5,6 +5,7 @@ use serde::Serialize;
 /// Outcome of a single check, ordered from best to worst.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum Status {
     /// The requirement is met.
     Pass,
@@ -36,7 +37,7 @@ impl Status {
 pub struct Fix {
     /// Copy-pasteable shell command, or a short instruction when no single command applies.
     pub cmd: String,
-    /// Caveat shown next to the command; empty when there is none.
+    /// Caveat, rendered on its own line after the command; empty when there is none.
     pub note: String,
 }
 

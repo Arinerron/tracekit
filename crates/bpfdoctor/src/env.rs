@@ -34,6 +34,17 @@ pub struct MountFlags {
     pub readonly: bool,
 }
 
+/// The `security.capability` attribute of an executable, as set by `setcap`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FileCaps {
+    /// Permitted capabilities, as a bitmask indexed by [`Cap::bit`](crate::Cap::bit).
+    pub permitted: u64,
+    /// The effective flag (`+e` in `setcap …+ep`): the permitted capabilities
+    /// are raised to effective at `execve`. Without it (`+p`) they are only
+    /// permitted, and a program that does not raise them itself runs without them.
+    pub effective: bool,
+}
+
 /// Process credentials plus the invoking user when run via `sudo`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Ids {
@@ -53,6 +64,7 @@ pub struct Ids {
 
 /// Kernel feature probes that need a real `bpf(2)` call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum BpfProbe {
     /// Create a `BPF_MAP_TYPE_RINGBUF` map.
     RingBuf,
@@ -85,8 +97,8 @@ pub trait Env {
     /// Capability sets of the current process.
     fn caps(&self) -> CapSets;
 
-    /// Permitted mask of the `security.capability` attribute on `path`, if any.
-    fn file_caps(&self, path: &Path) -> Option<u64>;
+    /// The `security.capability` attribute on `path`, if any.
+    fn file_caps(&self, path: &Path) -> Option<FileCaps>;
 
     /// Mount flags of the filesystem holding `path`, if they can be determined.
     fn mount_flags(&self, path: &Path) -> Option<MountFlags>;
@@ -108,24 +120,29 @@ pub trait Env {
 }
 
 /// Decodes a `security.capability` attribute (`struct vfs_cap_data`, revisions
-/// 1 to 3) into its permitted mask.
-pub(crate) fn decode_vfs_cap(raw: &[u8]) -> Option<u64> {
+/// 1 to 3) into its permitted mask and effective flag.
+pub(crate) fn decode_vfs_cap(raw: &[u8]) -> Option<FileCaps> {
     const REVISION_MASK: u32 = 0xFF00_0000;
     const REVISION_1: u32 = 0x0100_0000;
     const REVISION_2: u32 = 0x0200_0000;
     const REVISION_3: u32 = 0x0300_0000;
+    const FLAGS_EFFECTIVE: u32 = 0x0000_0001;
 
     let word = |index: usize| {
         raw.get(index * 4..index * 4 + 4)
             .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
             .map(u32::from_le_bytes)
     };
-    let (low, high) = match (word(0)? & REVISION_MASK, raw.len()) {
+    let magic = word(0)?;
+    let (low, high) = match (magic & REVISION_MASK, raw.len()) {
         (REVISION_1, 12) => (word(1)?, 0),
         (REVISION_2, 20) | (REVISION_3, 24) => (word(1)?, word(3)?),
         _ => return None,
     };
-    Some((u64::from(high) << 32) | u64::from(low))
+    Some(FileCaps {
+        permitted: (u64::from(high) << 32) | u64::from(low),
+        effective: magic & FLAGS_EFFECTIVE != 0,
+    })
 }
 
 /// Value of `Key:` in a `/proc/<pid>/status` style file, trimmed.
@@ -147,20 +164,32 @@ mod tests {
             .collect()
     }
 
+    /// `(permitted, effective)` of a decoded attribute.
+    fn decode(raw: &[u8]) -> Option<(u64, bool)> {
+        decode_vfs_cap(raw).map(|caps| (caps.permitted, caps.effective))
+    }
+
     #[test]
     fn decodes_v2_and_v3_permitted_masks_across_both_words() {
         // cap_bpf (39) and cap_perfmon (38) live in the high word; effective flag set.
         let v2 = vfs_cap(0x0200_0001, &[1 << 21, 0, 0xC0, 0]);
-        assert_eq!(decode_vfs_cap(&v2), Some((0xC0 << 32) | (1 << 21)));
+        assert_eq!(decode(&v2), Some(((0xC0 << 32) | (1 << 21), true)));
         let v3 = vfs_cap(0x0300_0001, &[0, 0, 0xC0, 0, 1000]);
-        assert_eq!(decode_vfs_cap(&v3), Some(0xC0 << 32));
+        assert_eq!(decode(&v3), Some((0xC0 << 32, true)));
+    }
+
+    #[test]
+    fn decodes_missing_effective_flag() {
+        // `setcap cap_bpf,cap_perfmon+p`: permitted only.
+        let v2 = vfs_cap(0x0200_0000, &[0, 0, 0xC0, 0]);
+        assert_eq!(decode(&v2), Some((0xC0 << 32, false)));
     }
 
     #[test]
     fn decodes_v1_low_word_only() {
         assert_eq!(
-            decode_vfs_cap(&vfs_cap(0x0100_0000, &[1 << 21, 0])),
-            Some(1 << 21)
+            decode(&vfs_cap(0x0100_0000, &[1 << 21, 0])),
+            Some((1 << 21, false))
         );
     }
 

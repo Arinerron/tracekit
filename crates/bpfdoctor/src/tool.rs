@@ -1,5 +1,7 @@
 //! Identity of the tool being diagnosed.
 
+use std::fmt::Write as _;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use crate::Cap;
@@ -25,28 +27,54 @@ pub struct Tool {
 }
 
 impl Tool {
-    /// `sudo setcap <required caps + extra>+ep <target>`, with `target` shell-quoted.
+    /// `sudo setcap <required caps + extra>+ep <target>`, with `target` shell-quoted:
+    /// in single quotes, or in bash/zsh `$'…'` with `\xNN` escapes if it is not UTF-8.
     pub fn setcap_command(&self, extra: &[Cap], target: &Path) -> String {
+        format!(
+            "sudo setcap {}+ep {}",
+            setcap_list(&self.caps_with(extra)),
+            shell_quote(target)
+        )
+    }
+
+    /// The required capabilities followed by those in `extra` not already required.
+    pub(crate) fn caps_with(&self, extra: &[Cap]) -> Vec<Cap> {
         let mut caps = self.required_caps.to_vec();
         for &cap in extra {
             if !caps.contains(&cap) {
                 caps.push(cap);
             }
         }
-        format!(
-            "sudo setcap {}+ep {}",
-            setcap_list(&caps),
-            shell_quote(target)
-        )
+        caps
     }
 }
 
-/// Quotes `path` for POSIX shells unless it consists only of safe characters.
+/// Bytes that never need quoting in a shell word.
+fn shell_safe(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"/._-+:,@%=".contains(&byte)
+}
+
+/// Quotes `path` for the shell unless it consists only of safe characters.
+///
+/// UTF-8 paths are single-quoted, which every POSIX shell accepts. Other paths
+/// are written in bash/zsh ANSI-C quoting, `$'…'`, with each unsafe byte as a
+/// `\xNN` escape, so the command still names the exact file.
 pub(crate) fn shell_quote(path: &Path) -> String {
-    let text = path.to_string_lossy();
-    let safe = |b: u8| b.is_ascii_alphanumeric() || b"/._-+:,@%=".contains(&b);
-    if !text.is_empty() && text.bytes().all(safe) {
-        text.into_owned()
+    let Some(text) = path.to_str() else {
+        let mut quoted = String::from("$'");
+        for &byte in path.as_os_str().as_bytes() {
+            if shell_safe(byte) {
+                quoted.push(char::from(byte));
+            } else {
+                // Writing to a `String` cannot fail.
+                let _ = write!(quoted, "\\x{byte:02x}");
+            }
+        }
+        quoted.push('\'');
+        return quoted;
+    };
+    if !text.is_empty() && text.bytes().all(shell_safe) {
+        text.to_owned()
     } else {
         format!("'{}'", text.replace('\'', r"'\''"))
     }

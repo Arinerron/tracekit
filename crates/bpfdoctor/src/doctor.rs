@@ -9,7 +9,9 @@ use crate::checks::{PREFLIGHT_IDS, SHARED};
 use crate::{Diagnostic, Env, Status, Tool, Uname};
 
 /// One diagnosis step. Implement it for tool-specific checks.
-pub trait Check {
+///
+/// Checks are `Send + Sync` so that a [`Doctor`] can be shared or moved across threads.
+pub trait Check: Send + Sync {
     /// Stable dotted identifier, e.g. `priv.capabilities`; must equal the
     /// [`Diagnostic::id`] that [`run`](Check::run) returns.
     fn id(&self) -> &'static str;
@@ -155,6 +157,9 @@ impl Report {
     }
 
     /// Writes the aligned, human-readable report; `color` adds ANSI colours.
+    ///
+    /// Each fix command stands alone on its `fix:` or `or:` line so it can be
+    /// copied as is; a fix's note follows on its own `note:` line.
     pub fn render_human(&self, w: &mut dyn io::Write, color: bool) -> io::Result<()> {
         writeln!(
             w,
@@ -186,12 +191,10 @@ impl Report {
             }
             for (index, fix) in check.fixes.iter().enumerate() {
                 let label = if index == 0 { "fix:" } else { "or:" };
-                write!(w, "      {label:<8}{}", fix.cmd)?;
-                // A shell comment keeps the line copy-pasteable.
+                writeln!(w, "      {label:<8}{}", fix.cmd)?;
                 if !fix.note.is_empty() {
-                    write!(w, "  # {}", fix.note)?;
+                    writeln!(w, "      note:   {}", fix.note)?;
                 }
-                writeln!(w)?;
             }
             if let Some(explain) = &check.explain {
                 writeln!(w, "      why:    {explain}")?;

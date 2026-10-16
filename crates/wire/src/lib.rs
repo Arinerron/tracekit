@@ -17,7 +17,7 @@
 //! # Example
 //!
 //! ```
-//! wire::wire! {
+//! tracekit_wire::wire! {
 //!     /// Common prefix of every event.
 //!     pub struct EvHeader {
 //!         pub kind: u32,
@@ -32,7 +32,7 @@
 //!     }
 //! }
 //!
-//! wire::wire_consts! {
+//! tracekit_wire::wire_consts! {
 //!     /// Constants shared with the BPF program.
 //!     pub group ABI_CONSTS;
 //!     /// Event kind of [`ExecEvent`].
@@ -40,7 +40,7 @@
 //! }
 //!
 //! // build.rs, with the `std` feature:
-//! let header = wire::HeaderBuilder::new("WHYTIME_WIRE_H")
+//! let header = tracekit_wire::HeaderBuilder::new("WHYTIME_WIRE_H")
 //!     .structs::<EvHeader>()
 //!     .structs::<ExecEvent>()
 //!     .consts(&ABI_CONSTS)
@@ -50,7 +50,7 @@
 //!
 //! // Loader: decode a ring buffer record.
 //! let bytes = [0_u8; 32];
-//! let event: ExecEvent = wire::read(&bytes).unwrap();
+//! let event: ExecEvent = tracekit_wire::read(&bytes).unwrap();
 //! assert_eq!(event.hdr.kind, 0);
 //! ```
 //!

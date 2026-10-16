@@ -58,6 +58,8 @@ pub fn ids_for_errno(errno: i32) -> &'static [&'static str] {
             "platform.os_arch",
             "kernel.version",
             "kernel.btf",
+            // Lockdown makes the verifier reject bpf_probe_read_kernel as an unknown helper.
+            "sec.lockdown",
             "probe.ringbuf",
         ],
         libc::ENOENT => &["kernel.version", "kernel.btf"],

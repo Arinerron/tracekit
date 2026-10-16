@@ -1,11 +1,8 @@
 //! Capabilities and the mechanisms that grant or block them.
 
-use std::path::Path;
-
-use super::{Shared, missing_caps, privileged, sudo_tool};
+use super::{Shared, missing_caps, privileged, setcap_fix, sudo_tool};
 use crate::cap::{names, rationale};
-use crate::tool::shell_quote;
-use crate::{Cap, Diagnostic, Env, Fix, Status, Tool};
+use crate::{Cap, Diagnostic, Env, FileCaps, Fix, Status, Tool};
 
 const SETCAP_NOTE: &str = "one-time; re-run after every reinstall";
 
@@ -13,48 +10,117 @@ pub(super) fn capabilities(check: &Shared, env: &dyn Env, tool: &Tool) -> Diagno
     if tool.required_caps.is_empty() {
         return check.diag(Status::Pass, "no capabilities required");
     }
-    let missing = missing_caps(env.caps().effective, tool.required_caps);
+    let caps = env.caps();
+    let missing = missing_caps(caps.effective, tool.required_caps);
     if missing.is_empty() {
         return check.diag(
             Status::Pass,
             format!("{} effective", names(tool.required_caps)),
         );
     }
-    let observed = format!(
-        "missing {} (uid {}, {})",
-        names(&missing),
-        env.ids().uid,
+    let unbounded = missing_caps(caps.bounding, tool.required_caps);
+    let state = if unbounded.is_empty() {
         file_caps_state(env, tool)
+    } else {
+        format!("bounding set excludes {}", names(&unbounded))
+    };
+    let observed = format!(
+        "missing {} (uid {}, {state})",
+        names(&missing),
+        env.ids().uid
     );
-    check
+    let diag = check
         .diag(Status::Fail, observed)
         .with_impact(format!(
             "cannot load tracing programs; {} cannot run",
             tool.name
         ))
-        .with_fix(Fix::new(tool.setcap_command(&[], &tool.exe), SETCAP_NOTE))
-        .with_fix(Fix::new(sudo_tool(tool), "run once with root"))
-        .with_explain(rationale(tool.required_caps))
+        .with_fix(setcap_fix(env, tool, &[], SETCAP_NOTE));
+    // Not even root gains capabilities outside the bounding set.
+    let diag = if unbounded.is_empty() {
+        diag.with_fix(Fix::new(sudo_tool(tool), "run once with root"))
+    } else {
+        diag
+    };
+    diag.with_explain(rationale(tool.required_caps))
+}
+
+/// The executable's file capabilities, unless it has none.
+fn installed_caps(env: &dyn Env, tool: &Tool) -> Option<FileCaps> {
+    env.file_caps(&tool.exe).filter(|file| file.permitted != 0)
 }
 
 /// How the executable's file capabilities relate to the required set.
 fn file_caps_state(env: &dyn Env, tool: &Tool) -> String {
-    let exe = tool.exe.display();
-    let Some(mask) = env.file_caps(&tool.exe).filter(|&mask| mask != 0) else {
-        return format!("no file capabilities on {exe}");
+    let Some(file) = installed_caps(env, tool) else {
+        return format!("no file capabilities on {}", tool.exe.display());
     };
-    let lacking = missing_caps(mask, tool.required_caps);
+    let lacking = missing_caps(file.permitted, tool.required_caps);
     if lacking.is_empty() {
-        format!("file capabilities on {exe} are not in effect")
+        Lost::of(env, tool, file).observed(tool)
     } else {
-        format!("file capabilities on {exe} lack {}", names(&lacking))
+        format!(
+            "file capabilities on {} lack {}",
+            tool.exe.display(),
+            names(&lacking)
+        )
+    }
+}
+
+/// Why file capabilities that grant every required capability are not in effect.
+enum Lost {
+    /// The bounding set excludes these required capabilities.
+    Bounding(Vec<Cap>),
+    /// The executable is on a nosuid mount.
+    Nosuid,
+    /// `no_new_privs` is set.
+    NoNewPrivs,
+    /// Installed `+p` without `+e`: permitted, but not raised to effective.
+    NoEffectiveFlag,
+    /// None of the above.
+    Unknown,
+}
+
+impl Lost {
+    fn of(env: &dyn Env, tool: &Tool, file: FileCaps) -> Self {
+        let unbounded = missing_caps(env.caps().bounding, tool.required_caps);
+        if !unbounded.is_empty() {
+            Self::Bounding(unbounded)
+        } else if env.mount_flags(&tool.exe).is_some_and(|flags| flags.nosuid) {
+            Self::Nosuid
+        } else if env.no_new_privs() {
+            Self::NoNewPrivs
+        } else if !file.effective {
+            Self::NoEffectiveFlag
+        } else {
+            Self::Unknown
+        }
+    }
+
+    /// E.g. `file capabilities on /usr/local/bin/whytime lack the effective flag (+e)`.
+    fn observed(&self, tool: &Tool) -> String {
+        let exe = tool.exe.display();
+        match self {
+            Self::Bounding(caps) => format!(
+                "file capabilities on {exe} are masked by the bounding set, which excludes {}",
+                names(caps)
+            ),
+            Self::Nosuid => format!("file capabilities on {exe} are ignored on its nosuid mount"),
+            Self::NoNewPrivs => {
+                format!("file capabilities on {exe} are ignored under no_new_privs")
+            }
+            Self::NoEffectiveFlag => {
+                format!("file capabilities on {exe} lack the effective flag (+e)")
+            }
+            Self::Unknown => format!("file capabilities on {exe} are not in effect"),
+        }
     }
 }
 
 pub(super) fn file_caps(check: &Shared, env: &dyn Env, tool: &Tool) -> Diagnostic {
     let exe = tool.exe.display();
-    let Some(mask) = env.file_caps(&tool.exe).filter(|&mask| mask != 0) else {
-        return if env.ids().euid == 0 {
+    let Some(file) = installed_caps(env, tool) else {
+        return if env.ids().euid == 0 && privileged(env, tool) {
             check.diag(
                 Status::Pass,
                 format!("no file capabilities on {exe}; not needed as root"),
@@ -66,14 +132,14 @@ pub(super) fn file_caps(check: &Shared, env: &dyn Env, tool: &Tool) -> Diagnosti
             )
         };
     };
-    let lacking = missing_caps(mask, tool.required_caps);
+    let lacking = missing_caps(file.permitted, tool.required_caps);
     if !lacking.is_empty() {
         return check
             .diag(
                 Status::Warn,
                 format!("file capabilities on {exe} lack {}", names(&lacking)),
             )
-            .with_fix(Fix::new(tool.setcap_command(&[], &tool.exe), SETCAP_NOTE));
+            .with_fix(setcap_fix(env, tool, &[], SETCAP_NOTE));
     }
     if privileged(env, tool) {
         return check.diag(
@@ -81,19 +147,32 @@ pub(super) fn file_caps(check: &Shared, env: &dyn Env, tool: &Tool) -> Diagnosti
             format!("file capabilities on {exe} in effect"),
         );
     }
-    check
-        .diag(
-            Status::Warn,
-            format!("file capabilities on {exe} are not in effect"),
-        )
+    let lost = Lost::of(env, tool, file);
+    let diag = check
+        .diag(Status::Warn, lost.observed(tool))
         .with_impact(format!(
             "{} runs without the capabilities it was installed with",
             tool.name
-        ))
-        .with_explain(
-            "the kernel ignores file capabilities on nosuid mounts and under no_new_privs; \
-             see priv.nosuid and priv.nnp",
-        )
+        ));
+    match lost {
+        Lost::Bounding(_) => diag
+            .with_fix(setcap_fix(env, tool, &[], SETCAP_NOTE))
+            .with_explain("the kernel masks file capabilities with the bounding set"),
+        Lost::Nosuid => diag
+            .with_explain("the kernel ignores file capabilities on nosuid mounts; see priv.nosuid"),
+        Lost::NoNewPrivs => diag
+            .with_explain("the kernel ignores file capabilities under no_new_privs; see priv.nnp"),
+        Lost::NoEffectiveFlag => diag
+            .with_fix(setcap_fix(env, tool, &[], SETCAP_NOTE))
+            .with_explain(
+                "without +e the capabilities are only permitted; \
+                 the kernel does not make them effective at execve",
+            ),
+        Lost::Unknown => diag.with_explain(
+            "the kernel grants file capabilities at execve, but not while an unprivileged \
+             tracer is attached, and the process may drop them afterwards",
+        ),
+    }
 }
 
 pub(super) fn nosuid(check: &Shared, env: &dyn Env, tool: &Tool) -> Diagnostic {
@@ -113,12 +192,6 @@ pub(super) fn nosuid(check: &Shared, env: &dyn Env, tool: &Tool) -> Diagnostic {
             format!("{exe} is on a nosuid mount; irrelevant while capabilities are effective"),
         );
     }
-    let target = format!("/usr/local/bin/{}", tool.name);
-    let install = format!(
-        "sudo install -m 0755 {} {target} && {}",
-        shell_quote(&tool.exe),
-        tool.setcap_command(&[], Path::new(&target))
-    );
     check
         .diag(
             Status::Fail,
@@ -128,10 +201,7 @@ pub(super) fn nosuid(check: &Shared, env: &dyn Env, tool: &Tool) -> Diagnostic {
             "setcap on {exe} has no effect; {} cannot run unprivileged",
             tool.name
         ))
-        .with_fix(Fix::new(
-            install,
-            "installs onto a mount that honours file capabilities",
-        ))
+        .with_fix(setcap_fix(env, tool, &[], SETCAP_NOTE))
 }
 
 pub(super) fn nnp(check: &Shared, env: &dyn Env, tool: &Tool) -> Diagnostic {
@@ -187,7 +257,7 @@ pub(super) fn optional_caps(check: &Shared, env: &dyn Env, tool: &Tool) -> Diagn
             format!("missing optional {}", names(&missing_caps)),
         )
         .with_impact(impact)
-        .with_fix(Fix::new(tool.setcap_command(&all, &tool.exe), SETCAP_NOTE))
+        .with_fix(setcap_fix(env, tool, &all, SETCAP_NOTE))
         .with_explain(rationale(&missing_caps))
 }
 

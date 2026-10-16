@@ -12,6 +12,11 @@ pub type Pid = u32;
 /// pid when a child forked, so every producer of keys (fork/exec/exit events and
 /// `/proc` reads) must use one clock. The table converts `/proc` start ticks into
 /// that clock through [`Config::start_clock`](crate::Config::start_clock).
+///
+/// `/proc` reports starts only to the clock tick. Under [`StartClock::BootNs`], a key
+/// the table builds from `/proc` is therefore rounded to a tick, and the table treats
+/// it as the same lifetime as any event key of that pid within the tick. The first
+/// such event replaces the rounded start with its precise one.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct ProcKey {
     /// Process id.
@@ -67,6 +72,7 @@ impl StartClock {
 
 /// Where a record's fields came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Source {
     /// Only fork/exec/comm/exit events, or inheritance from an event-sourced parent.
     Event,

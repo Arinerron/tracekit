@@ -7,6 +7,7 @@ const ESRCH: i32 = 3;
 
 /// Failure reading or reconciling process state.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ProcError {
     /// The process does not exist (`ENOENT`/`ESRCH`): it exited, or never existed.
     NotFound(Pid),

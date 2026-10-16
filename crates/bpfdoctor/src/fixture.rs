@@ -5,7 +5,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::{BpfProbe, CapSets, Env, Ids, MountFlags, Uname};
+use crate::{BpfProbe, CapSets, Env, FileCaps, Ids, MountFlags, Uname};
 
 /// An [`Env`] backed by a directory tree standing in for `/`, with in-memory
 /// file overrides and scripted credentials, limits and probe results.
@@ -19,7 +19,7 @@ pub struct FixtureEnv {
     files: HashMap<PathBuf, Option<Vec<u8>>>,
     uname: Uname,
     caps: CapSets,
-    file_caps: HashMap<PathBuf, u64>,
+    file_caps: HashMap<PathBuf, FileCaps>,
     mounts: HashMap<PathBuf, MountFlags>,
     no_new_privs: bool,
     ids: Ids,
@@ -89,10 +89,10 @@ impl FixtureEnv {
         self
     }
 
-    /// Sets the permitted file-capability mask of `path`.
+    /// Sets the `security.capability` attribute of `path`.
     #[must_use]
-    pub fn with_file_caps(mut self, path: impl Into<PathBuf>, mask: u64) -> Self {
-        self.file_caps.insert(path.into(), mask);
+    pub fn with_file_caps(mut self, path: impl Into<PathBuf>, caps: FileCaps) -> Self {
+        self.file_caps.insert(path.into(), caps);
         self
     }
 
@@ -167,7 +167,7 @@ impl Env for FixtureEnv {
         self.caps
     }
 
-    fn file_caps(&self, path: &Path) -> Option<u64> {
+    fn file_caps(&self, path: &Path) -> Option<FileCaps> {
         self.file_caps.get(path).copied()
     }
 

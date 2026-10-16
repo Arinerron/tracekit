@@ -1,10 +1,14 @@
 [package]
-name = "wire"
+name = "tracekit-wire"
 description = "Single-sourced kernel/user ABI types for eBPF tools, with generated C headers"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords = ["ebpf", "bpf", "abi", "ffi", "no-std"]
+categories = ["no-std", "development-tools::ffi", "os::linux-apis"]
 
 [features]
 # C header generation (`HeaderBuilder`); enabled by build scripts.
@@ -12,7 +16,7 @@ std = []
 
 [dev-dependencies]
 # Tests and doctests exercise header generation.
-wire = { path = ".", features = ["std"] }
+tracekit-wire = { path = ".", features = ["std"] }
 
 [lints]
 workspace = true

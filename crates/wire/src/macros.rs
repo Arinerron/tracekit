@@ -3,7 +3,7 @@
 /// Declares `#[repr(C)]` wire structs shared with BPF C code.
 ///
 /// ```
-/// wire::wire! {
+/// tracekit_wire::wire! {
 ///     /// Common prefix of every event.
 ///     pub struct EvHeader {
 ///         pub kind: u32,
@@ -20,7 +20,7 @@
 ///     }
 /// }
 ///
-/// use wire::{CType, WireStruct};
+/// use tracekit_wire::{CType, WireStruct};
 /// assert_eq!(ConnEvent::C_NAME, "conn_event");
 /// assert_eq!(ConnEvent::FIELDS[1].dims, &[8, 20]);
 /// assert_eq!(ConnEvent::SIZE, 184);
@@ -28,7 +28,10 @@
 ///
 /// Each struct gets:
 ///
-/// - `#[repr(C)]` and `#[derive(Clone, Copy, PartialEq, Eq)]`; further attributes pass through.
+/// - `#[repr(C)]` and `#[derive(Clone, Copy, PartialEq, Eq)]`; further attributes pass through
+///   to the struct. `#[cfg]` is not supported on individual structs or fields, since the
+///   generated impls always name them; gate the whole invocation instead
+///   (`#[cfg(feature = "net")] tracekit_wire::wire! { … }`).
 /// - A compact `Debug` impl: byte arrays print as byte strings with trailing NULs omitted
 ///   (`comm: b"bash"`), other arrays as lists.
 /// - [`Pod`](crate::Pod), [`CType`](crate::CType) (C name in snake case, `ConnEvent` →
@@ -37,7 +40,7 @@
 ///   uninitialised. Fill gaps with explicit `_pad` fields instead:
 ///
 /// ```compile_fail
-/// wire::wire! {
+/// tracekit_wire::wire! {
 ///     pub struct Padded {
 ///         pub a: u8,
 ///         pub b: u32, // three padding bytes before `b`
@@ -46,7 +49,7 @@
 /// ```
 ///
 /// ```
-/// wire::wire! {
+/// tracekit_wire::wire! {
 ///     pub struct Padded {
 ///         pub a: u8,
 ///         pub _pad: [u8; 3],
@@ -82,7 +85,7 @@ macro_rules! wire {
         }
 
         const _: () = {
-            const NAME: &$crate::__private::CName<
+            const __WIRE_C_NAME: &$crate::__private::CName<
                 { $crate::__private::c_name_capacity(::core::stringify!($name)) },
             > = &$crate::__private::CName::new(::core::stringify!($name));
 
@@ -99,11 +102,11 @@ macro_rules! wire {
             unsafe impl $crate::Pod for $name {}
 
             impl $crate::CType for $name {
-                const C_NAME: &'static str = NAME.c_name();
+                const C_NAME: &'static str = __WIRE_C_NAME.c_name();
             }
 
             impl $crate::__private::WireField for $name {
-                const C_TYPE: &'static str = NAME.c_type();
+                const C_TYPE: &'static str = __WIRE_C_NAME.c_type();
                 const DIMS: &'static $crate::__private::Dims = &$crate::__private::Dims::SCALAR;
 
                 fn fmt_field(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
@@ -143,10 +146,12 @@ macro_rules! wire {
 ///
 /// The first line names the group constant; each following item is an ordinary `const` of type
 /// `u8` … `u64` or `i8` … `i64`. The header gets `#define NAME VALUE` per constant, in decimal
-/// with a C suffix matching the type (see [`ConstValue`](crate::ConstValue)).
+/// with a C suffix matching the type (see [`ConstValue`](crate::ConstValue)). As with
+/// [`wire!`](crate::wire!), `#[cfg]` on individual constants is not supported; gate the whole
+/// invocation.
 ///
 /// ```
-/// wire::wire_consts! {
+/// tracekit_wire::wire_consts! {
 ///     /// Constants shared with the BPF program.
 ///     pub group ABI_CONSTS;
 ///     /// Ring buffer size in bytes.
@@ -157,7 +162,7 @@ macro_rules! wire {
 /// assert_eq!(RINGBUF_BYTES, 1 << 20);
 /// assert_eq!(ABI_CONSTS.name, "ABI_CONSTS");
 /// assert_eq!(ABI_CONSTS.consts[1].name, "EV_EXEC");
-/// assert_eq!(ABI_CONSTS.consts[1].value, wire::ConstValue::U8(1));
+/// assert_eq!(ABI_CONSTS.consts[1].value, tracekit_wire::ConstValue::U8(1));
 /// ```
 #[macro_export]
 macro_rules! wire_consts {
@@ -195,7 +200,7 @@ macro_rules! wire_consts {
 ///
 /// ```ignore
 /// #[cfg(feature = "user")]
-/// wire::impl_aya_pod!(EvHeader, ExecEvent);
+/// tracekit_wire::impl_aya_pod!(EvHeader, ExecEvent);
 /// ```
 ///
 /// Each type must implement [`Pod`](crate::Pod), whose contract matches aya's; anything else is a
@@ -205,7 +210,7 @@ macro_rules! impl_aya_pod {
     ($($ty:ty),+ $(,)?) => {$(
         const _: () = $crate::__private::require_pod::<$ty>();
 
-        // SAFETY: `$ty: wire::Pod`, which guarantees what `aya::Pod` requires.
+        // SAFETY: `$ty: tracekit_wire::Pod`, which guarantees what `aya::Pod` requires.
         unsafe impl ::aya::Pod for $ty {}
     )+};
 }

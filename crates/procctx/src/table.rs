@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, hash_map::Entry},
+    collections::{BTreeMap, HashMap},
     ffi::OsStr,
     ops::RangeInclusive,
     os::unix::ffi::OsStrExt,
@@ -323,6 +323,18 @@ fn slot_mut<'a>(
     }
 }
 
+/// Where the record of one process lifetime is.
+#[derive(Clone, Copy)]
+enum Found {
+    Live(Pid),
+    Dead(ProcKey),
+}
+
+/// A record that only an exit event made: no fork, exec or `/proc` facts yet.
+fn exit_only(info: &ProcInfo) -> bool {
+    info.source == Source::Event && info.fork_ts_ns.is_none() && info.exec_ts_ns.is_none()
+}
+
 impl<S: ProcSource> ProcTable<S> {
     /// An empty table reading `/proc` through `src`.
     pub fn new(src: S, cfg: Config) -> Self {
@@ -366,14 +378,22 @@ impl<S: ProcSource> ProcTable<S> {
     }
 
     /// The record for exactly this process lifetime, live or exited.
+    ///
+    /// Under [`StartClock::BootNs`], a record first read from `/proc` has a key rounded
+    /// to a clock tick until an event for it supplies the precise start. Either key
+    /// finds the record.
     pub fn get_key(&self, key: ProcKey) -> Option<&Arc<ProcInfo>> {
-        let live = self.live.get(&key.pid).filter(|slot| slot.info.key == key);
-        live.or_else(|| self.dead.get(&key)).map(|slot| &slot.info)
+        self.at(self.locate(key)?).map(|slot| &slot.info)
     }
 
     /// Records a fork. The child starts as a copy of its parent's record (comm, exe,
     /// argv, cwd, ids, cgroup, environment facts) until its own exec or
     /// [`enrich`](Self::enrich) replaces those fields. Thread creation is ignored.
+    ///
+    /// Events can arrive out of order across CPUs. If the child's exec, exit or
+    /// `/proc` read got there first, the fork adds only its timestamp and parent (and
+    /// the inherited fields, if only the exit was known). A late fork of an older
+    /// lifetime than the pid's live process, with no record of its own, is dropped.
     pub fn on_fork(&mut self, ev: ForkEvent) {
         self.observe(ev.ts_ns);
         if ev.is_thread {
@@ -381,45 +401,42 @@ impl<S: ProcSource> ProcTable<S> {
         }
         let touched = self.tick();
         let child = ev.child;
-        if let Some(slot) = self.live.get_mut(&child.pid)
-            && slot.info.key == child
-        {
-            // Exec or /proc got here first (events can arrive out of order across
-            // CPUs): add only what the fork knows.
+        let Some(found) = self.claim(child) else {
+            if self.displace(child) {
+                let slot = self.forked(ev, touched);
+                self.live.insert(child.pid, slot);
+            }
+            return;
+        };
+        let bare = self.at(found).is_some_and(|slot| exit_only(&slot.info));
+        let forked = bare.then(|| self.forked(ev, touched));
+        let Some(slot) = self.at_mut(found) else {
+            return;
+        };
+        if let Some(mut forked) = forked {
+            let info = Arc::make_mut(&mut forked.info);
+            info.key = slot.info.key;
+            info.exit = slot.info.exit;
+            *slot = forked;
+        } else {
             let info = Arc::make_mut(&mut slot.info);
             info.fork_ts_ns = Some(ev.ts_ns);
-            info.ppid = info.ppid.or(Some(ev.parent));
+            // Exec events and /proc may name a later, re-parented parent.
+            info.ppid = Some(ev.parent);
             slot.touched = touched;
-            return;
         }
-        self.retire(child.pid);
-        let parent = self
-            .live
-            .get(&ev.parent)
-            .filter(|parent| self.predates(parent.info.key, child.start));
-        let (mut info, pending_cgroup, inherited) = if let Some(parent) = parent {
-            (ProcInfo::clone(&parent.info), parent.pending_cgroup, true)
-        } else {
-            (self.blank.info(child, Source::Event), None, false)
-        };
-        info.key = child;
-        info.ppid = Some(ev.parent);
-        info.exec_ts_ns = None;
-        info.fork_ts_ns = Some(ev.ts_ns);
-        info.source = info.source.merge(Source::Event);
-        let slot = Slot {
-            info: Arc::new(info),
-            pending_cgroup,
-            inherited,
-            touched,
-        };
-        self.live.insert(child.pid, slot);
     }
 
     /// Records a successful exec. Fields the event carries replace the record's.
     /// Without `filename`, `argv` or `env`, those become unknown, because the old
-    /// values described the previous image. `cwd`, ppid, ids and cgroup survive the
-    /// exec when the event omits them.
+    /// values described the previous image. `cwd`, ids and cgroup survive the exec
+    /// when the event omits them. The event's ppid is used only when the parent is
+    /// unknown: a fork or `/proc` read already gave the fork-time parent, and by exec
+    /// time the process may have been re-parented.
+    ///
+    /// An exec that arrives after the process's exit event updates its tombstone. A
+    /// late exec of an older lifetime than the pid's live process, with no record of
+    /// its own, is dropped.
     ///
     /// When a non-leader thread execs, the kernel gives it the leader's identity. The
     /// caller must report such an exec with the thread-group id and the leader's start.
@@ -427,13 +444,15 @@ impl<S: ProcSource> ProcTable<S> {
         self.observe(ev.ts_ns);
         let touched = self.tick();
         let pid = ev.key.pid;
-        if self
-            .live
-            .get(&pid)
-            .is_some_and(|slot| slot.info.key != ev.key)
-        {
-            self.retire(pid);
-        }
+        let found = match self.claim(ev.key) {
+            Some(found) => found,
+            None if self.displace(ev.key) => {
+                let slot = Slot::new(self.blank.info(ev.key, Source::Event), touched);
+                self.live.insert(pid, slot);
+                Found::Live(pid)
+            }
+            None => return,
+        };
         let comm = ev
             .comm
             .or_else(|| ev.filename.map(exec_comm))
@@ -453,10 +472,9 @@ impl<S: ProcSource> ProcTable<S> {
         let cgroup = ev
             .cgroup_id
             .map(|id| (id, self.cgroups.by_id.get(&id).cloned()));
-        let slot = self
-            .live
-            .entry(pid)
-            .or_insert_with(|| Slot::new(self.blank.info(ev.key, Source::Event), touched));
+        let Some(slot) = self.at_mut(found) else {
+            return;
+        };
         let info = Arc::make_mut(&mut slot.info);
         if let Some(comm) = comm {
             info.comm = comm;
@@ -468,7 +486,7 @@ impl<S: ProcSource> ProcTable<S> {
         if let Some(cwd) = cwd {
             info.cwd = Some(cwd);
         }
-        info.ppid = ev.ppid.or(info.ppid);
+        info.ppid = info.ppid.or(ev.ppid);
         info.uid = ev.uid.or(info.uid);
         info.gid = ev.gid.or(info.gid);
         info.exec_ts_ns = Some(ev.ts_ns);
@@ -498,32 +516,45 @@ impl<S: ProcSource> ProcTable<S> {
     /// Records the exit of a whole process (deliver only the thread-group exit, not
     /// each thread's). The record becomes a tombstone. If the table had already
     /// inferred this exit, the event supplies the real time and status.
+    ///
+    /// An exit can overtake its process's fork or exec (events arrive out of order
+    /// across CPUs). Without a record, the exit becomes a tombstone that those late
+    /// events fill in, and an older live process with the same pid is retired.
     pub fn on_exit(&mut self, ev: ExitEvent) {
         self.observe(ev.ts_ns);
         let exit = ExitInfo {
             ts_ns: ev.ts_ns,
             code: Some(ev.code),
         };
-        if let Entry::Occupied(entry) = self.live.entry(ev.key.pid)
-            && entry.get().info.key == ev.key
-        {
-            let slot = entry.remove();
-            self.bury(slot, exit);
-            return;
-        }
-        let touched = self.tick();
-        if let Some(slot) = self.dead.get_mut(&ev.key)
-            && slot.info.exit.is_some_and(|known| known.code.is_none())
-        {
-            Arc::make_mut(&mut slot.info).exit = Some(exit);
-            slot.touched = touched;
+        match self.claim(ev.key) {
+            Some(Found::Live(pid)) => {
+                if let Some(slot) = self.live.remove(&pid) {
+                    self.bury(slot, exit);
+                }
+            }
+            Some(Found::Dead(key)) => {
+                let touched = self.tick();
+                if let Some(slot) = self.dead.get_mut(&key)
+                    && slot.info.exit.is_some_and(|known| known.code.is_none())
+                {
+                    Arc::make_mut(&mut slot.info).exit = Some(exit);
+                    slot.touched = touched;
+                }
+            }
+            None => {
+                // A newer live process keeps the pid either way.
+                self.displace(ev.key);
+                let slot = Slot::new(self.blank.info(ev.key, Source::Event), 0);
+                self.bury(slot, exit);
+            }
         }
     }
 
     /// Fills the live record of `pid` from `/proc` (blocking I/O). Missing fields are
     /// filled, and fields a forked child inherited are replaced with the process's own
     /// values. Without a record, one is built from `/proc` alone. A zombie becomes a
-    /// tombstone. An optional file that cannot be read (such as another user's
+    /// tombstone, and so does a process whose exit event was already seen, whatever
+    /// `/proc` shows. An optional file that cannot be read (such as another user's
     /// `environ`) leaves its fields unset instead of failing.
     ///
     /// If the start time in `/proc` shows that the pid now belongs to a different
@@ -690,6 +721,142 @@ impl<S: ProcSource> ProcTable<S> {
         clock.start_to_ticks(candidate.start) <= clock.start_to_ticks(start)
     }
 
+    /// Whether `start` lies on a tick boundary, as every key built from `/proc` does.
+    /// Under [`StartClock::Ticks`] every start does.
+    fn rounded(&self, start: u64) -> bool {
+        let clock = self.cfg.start_clock;
+        clock.ticks_to_start(clock.start_to_ticks(start)) == start
+    }
+
+    /// Whether `a` and `b` name one process lifetime. Under [`StartClock::BootNs`] a
+    /// key built from `/proc` is rounded to its tick, so it also matches the precise
+    /// event key of any start within that tick. (An event key that happens to lie on a
+    /// tick boundary counts as rounded; a second lifetime of the same pid within one
+    /// tick would be needed to confuse the two.)
+    fn same(&self, a: ProcKey, b: ProcKey) -> bool {
+        let clock = self.cfg.start_clock;
+        a == b
+            || (a.pid == b.pid
+                && clock.start_to_ticks(a.start) == clock.start_to_ticks(b.start)
+                && (self.rounded(a.start) || self.rounded(b.start)))
+    }
+
+    /// Keys of `key.pid` whose start falls in the same `/proc` tick as `key`'s.
+    fn tick_keys(&self, key: ProcKey) -> RangeInclusive<ProcKey> {
+        let clock = self.cfg.start_clock;
+        let ticks = clock.start_to_ticks(key.start);
+        let first = clock.ticks_to_start(ticks).min(key.start);
+        let next = clock.ticks_to_start(ticks.saturating_add(1));
+        let last = next.saturating_sub(1).max(key.start);
+        ProcKey {
+            pid: key.pid,
+            start: first,
+        }..=ProcKey {
+            pid: key.pid,
+            start: last,
+        }
+    }
+
+    /// The record of `key`'s lifetime (see [`same`](Self::same)), preferring an
+    /// exact key match.
+    fn locate(&self, key: ProcKey) -> Option<Found> {
+        let live = self.live.get(&key.pid).map(|slot| slot.info.key);
+        if live == Some(key) {
+            return Some(Found::Live(key.pid));
+        }
+        if self.dead.contains_key(&key) {
+            return Some(Found::Dead(key));
+        }
+        if live.is_some_and(|live| self.same(live, key)) {
+            return Some(Found::Live(key.pid));
+        }
+        self.dead
+            .range(self.tick_keys(key))
+            .map(|(dead, _)| *dead)
+            .find(|dead| self.same(*dead, key))
+            .map(Found::Dead)
+    }
+
+    /// [`locate`](Self::locate), then gives the record `key` if that is the precise
+    /// start of its rounded one.
+    fn claim(&mut self, key: ProcKey) -> Option<Found> {
+        let found = self.locate(key)?;
+        if self.rounded(key.start) {
+            return Some(found);
+        }
+        match found {
+            Found::Live(pid) => {
+                if let Some(slot) = self.live.get_mut(&pid)
+                    && slot.info.key != key
+                {
+                    Arc::make_mut(&mut slot.info).key = key;
+                }
+                Some(found)
+            }
+            Found::Dead(old) if old != key => {
+                let mut slot = self.dead.remove(&old)?;
+                Arc::make_mut(&mut slot.info).key = key;
+                self.dead.insert(key, slot);
+                Some(Found::Dead(key))
+            }
+            Found::Dead(_) => Some(found),
+        }
+    }
+
+    fn at(&self, found: Found) -> Option<&Slot> {
+        match found {
+            Found::Live(pid) => self.live.get(&pid),
+            Found::Dead(key) => self.dead.get(&key),
+        }
+    }
+
+    fn at_mut(&mut self, found: Found) -> Option<&mut Slot> {
+        match found {
+            Found::Live(pid) => self.live.get_mut(&pid),
+            Found::Dead(key) => self.dead.get_mut(&key),
+        }
+    }
+
+    /// Frees the pid of `key`, which has no record, by retiring an older live process.
+    /// Returns `false` if the live process is newer: the event for `key` is late.
+    fn displace(&mut self, key: ProcKey) -> bool {
+        if self
+            .live
+            .get(&key.pid)
+            .is_some_and(|slot| slot.info.key.start > key.start)
+        {
+            return false;
+        }
+        self.retire(key.pid);
+        true
+    }
+
+    /// A new record for the child of `ev`: a copy of its parent's if the table knows
+    /// the parent, otherwise blank.
+    fn forked(&self, ev: ForkEvent, touched: u64) -> Slot {
+        let child = ev.child;
+        let parent = self
+            .live
+            .get(&ev.parent)
+            .filter(|parent| self.predates(parent.info.key, child.start));
+        let (mut info, pending_cgroup, inherited) = if let Some(parent) = parent {
+            (ProcInfo::clone(&parent.info), parent.pending_cgroup, true)
+        } else {
+            (self.blank.info(child, Source::Event), None, false)
+        };
+        info.key = child;
+        info.ppid = Some(ev.parent);
+        info.exec_ts_ns = None;
+        info.fork_ts_ns = Some(ev.ts_ns);
+        info.source = info.source.merge(Source::Event);
+        Slot {
+            info: Arc::new(info),
+            pending_cgroup,
+            inherited,
+            touched,
+        }
+    }
+
     fn bury(&mut self, mut slot: Slot, exit: ExitInfo) {
         Arc::make_mut(&mut slot.info).exit = Some(exit);
         slot.touched = self.tick();
@@ -720,23 +887,31 @@ impl<S: ProcSource> ProcTable<S> {
         reused
     }
 
-    /// Merges `/proc` facts into the live record of `pid`, creating it if needed.
-    /// The caller has already retired a record of a different process.
+    /// Merges `/proc` facts into the live record of `pid`, creating it if needed. A
+    /// process with a tombstone is not revived: `/proc` only fills a tombstone that
+    /// holds nothing but the exit. The caller has already retired a record of a
+    /// different process.
     fn absorb(&mut self, pid: Pid, stat: &StatLine) {
-        let clock = self.cfg.start_clock;
-        let known_dead = self
-            .dead
-            .range(pid_keys(pid))
-            .any(|(key, _)| clock.start_to_ticks(key.start) == stat.start_ticks);
-        if stat.has_exited() && known_dead {
-            // A zombie whose exit is already recorded: /proc has nothing newer.
-            return;
-        }
         let key = ProcKey {
             pid,
-            start: clock.ticks_to_start(stat.start_ticks),
+            start: self.cfg.start_clock.ticks_to_start(stat.start_ticks),
         };
-        let read = self.read_proc(pid, stat);
+        // The exit event fires before the kernel makes the task a zombie, so /proc may
+        // still show a process whose exit is already recorded as running.
+        let dead = self.dead.range(self.tick_keys(key)).next_back();
+        if let Some((&dead, slot)) = dead {
+            // /proc has nothing newer, unless the exit event is all the table knows.
+            if exit_only(&slot.info) {
+                let read = self.read_proc(pid, stat, Some(dead));
+                let touched = self.tick();
+                if let Some(slot) = self.dead.get_mut(&dead) {
+                    read.apply(slot, stat);
+                    slot.touched = touched;
+                }
+            }
+            return;
+        }
+        let read = self.read_proc(pid, stat, None);
         let touched = self.tick();
         let slot = self
             .live
@@ -749,10 +924,14 @@ impl<S: ProcSource> ProcTable<S> {
         }
     }
 
-    /// Reads the `/proc` files for what the live record of `pid` lacks, or holds only
-    /// by inheritance from its parent. Without a record, it reads everything.
-    fn read_proc(&mut self, pid: Pid, stat: &StatLine) -> ProcRead {
-        let slot = self.live.get(&pid);
+    /// Reads the `/proc` files for what the record of `pid` lacks, or holds only by
+    /// inheritance from its parent. The record is the live one, or the tombstone with
+    /// key `dead`. Without a record, it reads everything.
+    fn read_proc(&mut self, pid: Pid, stat: &StatLine, dead: Option<ProcKey>) -> ProcRead {
+        let slot = match dead {
+            Some(key) => self.dead.get(&key),
+            None => self.live.get(&pid),
+        };
         let refresh = slot.is_some_and(|slot| slot.inherited);
         let lacks = |missing: fn(&ProcInfo) -> bool| slot.is_none_or(|slot| missing(&slot.info));
         let stale = |missing: fn(&ProcInfo) -> bool| refresh || lacks(missing);

@@ -6,9 +6,10 @@ mod privilege;
 mod security;
 mod system;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::{BpfProbe, Cap, Check, Diagnostic, Env, Status, Tool, errno_name, parse_release};
+use crate::tool::shell_quote;
+use crate::{BpfProbe, Cap, Check, Diagnostic, Env, Fix, Status, Tool, errno_name, parse_release};
 
 /// A built-in check: static metadata plus the function that evaluates it.
 #[derive(Clone, Copy)]
@@ -246,4 +247,50 @@ fn errno_label(errno: i32) -> String {
 /// `sudo whytime ...`.
 fn sudo_tool(tool: &Tool) -> String {
     format!("sudo {} ...", tool.name)
+}
+
+/// Note on fixes that install a copy of the executable off its nosuid mount.
+const INSTALL_NOTE: &str = "installs onto a mount that honours file capabilities";
+
+/// Note on fixes that replace `setcap` because of the bounding set.
+const BOUNDING_NOTE: &str = "setcap and sudo cannot grant capabilities outside the bounding set; \
+     the container runtime or service manager must allow them";
+
+/// The fix that grants the tool its required capabilities plus `extra` through
+/// file capabilities, with `note` as its caveat.
+///
+/// That is `setcap` on the executable, unless the bounding set excludes any of
+/// those capabilities, where only the container recipe can help, or the
+/// executable is on a nosuid mount, which ignores file capabilities: then the
+/// command first installs a copy into `/usr/local/bin`.
+fn setcap_fix(env: &dyn Env, tool: &Tool, extra: &[Cap], note: &str) -> Fix {
+    let caps = tool.caps_with(extra);
+    if !missing_caps(env.caps().bounding, &caps).is_empty() {
+        return Fix::new(container_recipe(&caps), BOUNDING_NOTE);
+    }
+    if !env.mount_flags(&tool.exe).is_some_and(|flags| flags.nosuid) {
+        return Fix::new(tool.setcap_command(extra, &tool.exe), note);
+    }
+    let target = PathBuf::from(format!("/usr/local/bin/{}", tool.name));
+    Fix::new(
+        format!(
+            "sudo install -m 0755 {} {} && {}",
+            shell_quote(&tool.exe),
+            shell_quote(&target),
+            tool.setcap_command(extra, &target)
+        ),
+        format!("{INSTALL_NOTE}; {note}"),
+    )
+}
+
+/// `docker run --cap-add BPF --cap-add PERFMON --pid=host -v … ...` granting `caps`.
+fn container_recipe(caps: &[Cap]) -> String {
+    let mut recipe = String::from("docker run");
+    for cap in caps {
+        let name = cap.name();
+        recipe.push_str(" --cap-add ");
+        recipe.push_str(name.strip_prefix("CAP_").unwrap_or(name));
+    }
+    recipe.push_str(" --pid=host -v /sys/kernel/btf:/sys/kernel/btf:ro ...");
+    recipe
 }

@@ -4,6 +4,7 @@ use std::fmt;
 
 /// A Linux capability a BPF tool may need.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Cap {
     /// `CAP_BPF` (5.8+): create maps and load programs.
     Bpf,
@@ -23,7 +24,7 @@ pub enum Cap {
 
 impl Cap {
     /// Every capability, in display order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: &'static [Self] = &[
         Self::Bpf,
         Self::Perfmon,
         Self::SysAdmin,

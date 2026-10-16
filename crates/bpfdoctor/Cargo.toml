@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords = ["ebpf", "bpf", "diagnostics", "capabilities", "preflight"]
+categories = ["os::linux-apis", "development-tools::debugging"]
 
 [features]
 # Exposes `FixtureEnv` so tools can test their own checks against fixture trees.
@@ -16,7 +20,8 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
-bpfdoctor = { workspace = true, features = ["testing"] }
+# Integration tests drive the checks through `FixtureEnv`.
+bpfdoctor = { path = ".", features = ["testing"] }
 
 [lints]
 workspace = true

@@ -2,14 +2,26 @@
 
 mod common;
 
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
+
 use bpfdoctor::{
-    BpfProbe, Cap, CapSets, Diagnostic, Doctor, FixtureEnv, Ids, MountFlags, Status, Tool,
+    BpfProbe, Cap, CapSets, Diagnostic, Doctor, FileCaps, FixtureEnv, Ids, MountFlags, Status, Tool,
 };
 use common::{host, tool};
 
 const EXE: &str = "/usr/local/bin/whytime";
 const BPF_PERFMON: u64 = Cap::Bpf.mask() | Cap::Perfmon.mask();
 const SETCAP: &str = "sudo setcap cap_bpf,cap_perfmon+ep /usr/local/bin/whytime";
+/// A `cargo install` target on a nosuid `/home`.
+const CARGO_EXE: &str = "/home/me/.cargo/bin/whytime";
+const NOSUID: MountFlags = MountFlags {
+    nosuid: true,
+    readonly: false,
+};
+const RECIPE: &str = "docker run --cap-add BPF --cap-add PERFMON --pid=host -v /sys/kernel/btf:/sys/kernel/btf:ro ...";
+/// Docker's default capability set, which is also its bounding set.
+const DOCKER_CAPS: u64 = 0xa804_25fb;
 
 fn user() -> Ids {
     Ids {
@@ -30,6 +42,32 @@ fn caps(effective: u64) -> CapSets {
     }
 }
 
+/// File capabilities installed with `setcap …+ep`.
+fn ep(permitted: u64) -> FileCaps {
+    FileCaps {
+        permitted,
+        effective: true,
+    }
+}
+
+fn cargo_tool() -> Tool {
+    Tool {
+        exe: CARGO_EXE.into(),
+        ..tool()
+    }
+}
+
+/// Root in a default Docker container, whose bounding set lacks every BPF capability.
+fn docker_root() -> FixtureEnv {
+    host()
+        .with_caps(CapSets {
+            effective: DOCKER_CAPS,
+            permitted: DOCKER_CAPS,
+            bounding: DOCKER_CAPS,
+        })
+        .with_file("/.dockerenv", "")
+}
+
 /// A non-root user without capabilities.
 fn unprivileged() -> FixtureEnv {
     host().with_ids(user()).with_caps(caps(0))
@@ -40,7 +78,7 @@ fn setcap_user() -> FixtureEnv {
     host()
         .with_ids(user())
         .with_caps(caps(BPF_PERFMON))
-        .with_file_caps(EXE, BPF_PERFMON)
+        .with_file_caps(EXE, ep(BPF_PERFMON))
 }
 
 fn proc_status(nspid: &str, seccomp: u8) -> String {
@@ -265,7 +303,7 @@ fn capabilities_fail_with_exact_setcap_line() {
 fn capabilities_report_only_missing_caps_and_file_cap_state() {
     let env = unprivileged()
         .with_caps(caps(Cap::Bpf.mask()))
-        .with_file_caps(EXE, BPF_PERFMON);
+        .with_file_caps(EXE, ep(BPF_PERFMON));
     let diag = run(&env, "priv.capabilities");
     assert_eq!(
         diag.observed,
@@ -286,6 +324,62 @@ fn capabilities_quote_exe_paths_in_fixes() {
     );
 }
 
+#[test]
+fn capabilities_quote_non_utf8_exe_paths_byte_exact() {
+    let latin1 = Tool {
+        exe: OsStr::from_bytes(b"/opt/caf\xe9/it's").into(),
+        ..tool()
+    };
+    let diag = run_with(&unprivileged(), &latin1, "priv.capabilities");
+    assert_eq!(
+        fixes(&diag)[0],
+        r"sudo setcap cap_bpf,cap_perfmon+ep $'/opt/caf\xe9/it\x27s'"
+    );
+}
+
+#[test]
+fn capabilities_setcap_fix_installs_off_nosuid_mount() {
+    let env = unprivileged().with_mount_flags(CARGO_EXE, NOSUID);
+    let diag = run_with(&env, &cargo_tool(), "priv.capabilities");
+    assert_eq!(
+        fixes(&diag),
+        [
+            "sudo install -m 0755 /home/me/.cargo/bin/whytime /usr/local/bin/whytime \
+          && sudo setcap cap_bpf,cap_perfmon+ep /usr/local/bin/whytime",
+            "sudo whytime ...",
+        ]
+    );
+    assert_eq!(
+        diag.fixes[0].note,
+        "installs onto a mount that honours file capabilities; one-time; re-run after every reinstall"
+    );
+    // The same command priv.nosuid gives.
+    let nosuid = run_with(&env, &cargo_tool(), "priv.nosuid");
+    assert_eq!(fixes(&nosuid), fixes(&diag)[..1]);
+}
+
+#[test]
+fn capabilities_outside_bounding_set_get_container_recipe() {
+    let diag = run(&docker_root(), "priv.capabilities");
+    assert_eq!(diag.status, Status::Fail);
+    assert_eq!(
+        diag.observed,
+        "missing CAP_BPF, CAP_PERFMON (uid 0, bounding set excludes CAP_BPF, CAP_PERFMON)"
+    );
+    // Neither setcap nor sudo can exceed the bounding set.
+    assert_eq!(fixes(&diag), [RECIPE]);
+    // CAP_SYS_ADMIN in the bounding set still covers CAP_BPF and CAP_PERFMON.
+    let admin_bound = docker_root().with_caps(CapSets {
+        effective: DOCKER_CAPS,
+        permitted: DOCKER_CAPS,
+        bounding: DOCKER_CAPS | Cap::SysAdmin.mask(),
+    });
+    assert_eq!(
+        fixes(&run(&admin_bound, "priv.capabilities")),
+        [SETCAP, "sudo whytime ..."]
+    );
+}
+
 // priv.file_caps
 
 #[test]
@@ -295,20 +389,82 @@ fn file_caps_pass_when_in_effect() {
 }
 
 #[test]
-fn file_caps_warn_when_present_but_not_effective() {
-    let diag = run(&setcap_user().with_caps(caps(0)), "priv.file_caps");
-    assert_eq!(diag.status, Status::Warn);
-    assert!(
-        diag.explain
-            .as_deref()
-            .is_some_and(|why| why.contains("priv.nosuid") && why.contains("priv.nnp"))
+fn file_caps_do_not_pass_root_without_effective_caps() {
+    let diag = run(&docker_root(), "priv.file_caps");
+    assert_eq!(diag.status, Status::Info);
+    assert_eq!(
+        diag.observed,
+        "/usr/local/bin/whytime not installed with file capabilities"
     );
+}
+
+#[test]
+fn file_caps_name_why_they_are_not_in_effect() {
+    let lost = setcap_user().with_caps(caps(0));
+
+    // `setcap …+p`: permitted only, never raised to effective.
+    let permitted_only = lost.clone().with_file_caps(
+        EXE,
+        FileCaps {
+            permitted: BPF_PERFMON,
+            effective: false,
+        },
+    );
+    let diag = run(&permitted_only, "priv.file_caps");
+    assert_eq!(diag.status, Status::Warn);
+    assert_eq!(
+        diag.observed,
+        "file capabilities on /usr/local/bin/whytime lack the effective flag (+e)"
+    );
+    assert_eq!(fixes(&diag), [SETCAP]);
+    assert!(
+        run(&permitted_only, "priv.capabilities")
+            .observed
+            .ends_with("lack the effective flag (+e))")
+    );
+
+    let bounded = lost.clone().with_caps(CapSets::default());
+    let diag = run(&bounded, "priv.file_caps");
+    assert_eq!(
+        diag.observed,
+        "file capabilities on /usr/local/bin/whytime are masked by the bounding set, \
+         which excludes CAP_BPF, CAP_PERFMON"
+    );
+    assert_eq!(fixes(&diag), [RECIPE]);
+
+    let nosuid = run(
+        &lost.clone().with_mount_flags(EXE, NOSUID),
+        "priv.file_caps",
+    );
+    assert_eq!(
+        nosuid.observed,
+        "file capabilities on /usr/local/bin/whytime are ignored on its nosuid mount"
+    );
+    assert!(
+        nosuid
+            .explain
+            .is_some_and(|why| why.contains("priv.nosuid"))
+    );
+
+    let nnp = run(&lost.clone().with_no_new_privs(true), "priv.file_caps");
+    assert_eq!(
+        nnp.observed,
+        "file capabilities on /usr/local/bin/whytime are ignored under no_new_privs"
+    );
+    assert!(nnp.explain.is_some_and(|why| why.contains("priv.nnp")));
+
+    let unexplained = run(&lost, "priv.file_caps");
+    assert_eq!(
+        unexplained.observed,
+        "file capabilities on /usr/local/bin/whytime are not in effect"
+    );
+    assert!(unexplained.fixes.is_empty());
 }
 
 #[test]
 fn file_caps_warn_when_incomplete_and_inform_when_absent() {
     let partial = run(
-        &unprivileged().with_file_caps(EXE, Cap::Bpf.mask()),
+        &unprivileged().with_file_caps(EXE, ep(Cap::Bpf.mask())),
         "priv.file_caps",
     );
     assert_eq!(partial.status, Status::Warn);
@@ -406,6 +562,28 @@ fn optional_caps_warn_with_full_setcap_line() {
     assert_eq!(
         fixes(&diag),
         ["sudo setcap cap_bpf,cap_perfmon,cap_sys_ptrace+ep /usr/local/bin/whytime"]
+    );
+}
+
+#[test]
+fn optional_caps_fix_respects_nosuid_and_bounding_set() {
+    let nosuid = host()
+        .with_ids(user())
+        .with_caps(caps(BPF_PERFMON))
+        .with_mount_flags(CARGO_EXE, NOSUID);
+    assert_eq!(
+        fixes(&run_with(&nosuid, &cargo_tool(), "priv.optional_caps")),
+        [
+            "sudo install -m 0755 /home/me/.cargo/bin/whytime /usr/local/bin/whytime \
+          && sudo setcap cap_bpf,cap_perfmon,cap_sys_ptrace+ep /usr/local/bin/whytime"
+        ]
+    );
+    assert_eq!(
+        fixes(&run(&docker_root(), "priv.optional_caps")),
+        [
+            "docker run --cap-add BPF --cap-add PERFMON --cap-add SYS_PTRACE --pid=host \
+             -v /sys/kernel/btf:/sys/kernel/btf:ro ..."
+        ]
     );
 }
 
@@ -602,6 +780,17 @@ fn memlock_limits_line_falls_back_to_uid_range() {
 }
 
 #[test]
+fn memlock_setcap_fix_installs_off_nosuid_mount() {
+    let env = old_kernel_low_memlock().with_mount_flags(CARGO_EXE, NOSUID);
+    let diag = run_with(&env, &cargo_tool(), "rlimit.memlock");
+    assert_eq!(
+        fixes(&diag)[0],
+        "sudo install -m 0755 /home/me/.cargo/bin/whytime /usr/local/bin/whytime \
+         && sudo setcap cap_bpf,cap_perfmon,cap_sys_resource+ep /usr/local/bin/whytime"
+    );
+}
+
+#[test]
 fn memlock_uses_kernel_version_when_probe_is_refused() {
     // An unprivileged probe says nothing; the release decides.
     let old = unprivileged()
@@ -672,7 +861,6 @@ fn container_passes_on_host() {
 
 #[test]
 fn container_detected_by_marker_or_cgroup() {
-    const RECIPE: &str = "docker run --cap-add BPF --cap-add PERFMON --pid=host -v /sys/kernel/btf:/sys/kernel/btf:ro ...";
     let docker = run(&host().with_file("/.dockerenv", ""), "env.container");
     assert_eq!(docker.status, Status::Info);
     assert_eq!(docker.observed, "running in a container (/.dockerenv)");
@@ -723,6 +911,20 @@ fn seccomp_fails_only_when_bpf_is_blocked_despite_caps() {
     assert_eq!(run(&no_caps, "env.seccomp").status, Status::Info);
 }
 
+#[test]
+fn seccomp_does_not_blame_eperm_inside_user_namespace() {
+    // Rootless Podman: full capabilities that bpf() ignores outside the initial namespace.
+    let rootless = host()
+        .with_file("/proc/self/status", proc_status("4242", 2))
+        .with_file("/proc/self/uid_map", "0 100000 65536\n")
+        .with_probe(BpfProbe::RingBuf, Err(libc::EPERM));
+    let diag = run(&rootless, "env.seccomp");
+    assert_eq!(diag.status, Status::Info);
+    assert_eq!(diag.observed, "seccomp filter active (mode 2)");
+    assert!(diag.fixes.is_empty());
+    assert_eq!(run(&rootless, "env.userns").status, Status::Fail);
+}
+
 // fs.cgroup2
 
 #[test]
@@ -750,16 +952,31 @@ fn hidepid_passes_without_option() {
     assert_eq!(run(&host(), "fs.proc_hidepid").status, Status::Pass);
 }
 
+const HIDEPID_MOUNTINFO: &str =
+    "23 22 0:21 / /proc rw,nosuid,relatime shared:5 - proc proc rw,hidepid=invisible\n";
+
 #[test]
 fn hidepid_warns_when_set() {
-    let mountinfo =
-        "23 22 0:21 / /proc rw,nosuid,relatime shared:5 - proc proc rw,hidepid=invisible\n";
     let diag = run(
-        &host().with_file("/proc/self/mountinfo", mountinfo),
+        &unprivileged().with_file("/proc/self/mountinfo", HIDEPID_MOUNTINFO),
         "fs.proc_hidepid",
     );
     assert_eq!(diag.status, Status::Warn);
     assert_eq!(diag.observed, "/proc mounted with hidepid=invisible");
+}
+
+#[test]
+fn hidepid_has_no_effect_with_sys_ptrace() {
+    let root = run(
+        &host().with_file("/proc/self/mountinfo", HIDEPID_MOUNTINFO),
+        "fs.proc_hidepid",
+    );
+    assert_eq!(root.status, Status::Info);
+    assert!(root.fixes.is_empty());
+    let ptrace = unprivileged()
+        .with_caps(caps(Cap::SysPtrace.mask()))
+        .with_file("/proc/self/mountinfo", HIDEPID_MOUNTINFO);
+    assert_eq!(run(&ptrace, "fs.proc_hidepid").status, Status::Info);
 }
 
 // probe.ringbuf

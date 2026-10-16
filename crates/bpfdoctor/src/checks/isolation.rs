@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use super::{PROC_STATUS, Shared, privileged, read_text};
+use super::{PROC_STATUS, Shared, container_recipe, privileged, read_text};
 use crate::env::status_field;
 use crate::{BpfProbe, Diagnostic, Env, Fix, Status, Tool};
 
@@ -18,14 +18,18 @@ const CGROUP_RUNTIMES: [(&str, &str); 6] = [
     ("containerd", "containerd"),
     ("crio-", "cri-o"),
 ];
-const CONTAINER_RECIPE: &str = "docker run --cap-add BPF --cap-add PERFMON --pid=host -v /sys/kernel/btf:/sys/kernel/btf:ro ...";
+
+/// Whether this process is in the initial user namespace, judged by an identity
+/// `uid_map`; `None` when the map is unreadable.
+fn initial_userns(env: &dyn Env) -> Option<bool> {
+    read_text(env, UID_MAP).map(|map| map.split_whitespace().eq(["0", "0", "4294967295"]))
+}
 
 pub(super) fn userns(check: &Shared, env: &dyn Env, tool: &Tool) -> Diagnostic {
-    let Some(map) = read_text(env, UID_MAP) else {
-        return check.diag(Status::Skip, format!("{UID_MAP} not readable"));
-    };
-    if map.split_whitespace().eq(["0", "0", "4294967295"]) {
-        return check.diag(Status::Pass, "initial user namespace");
+    match initial_userns(env) {
+        None => return check.diag(Status::Skip, format!("{UID_MAP} not readable")),
+        Some(true) => return check.diag(Status::Pass, "initial user namespace"),
+        Some(false) => {}
     }
     check
         .diag(Status::Fail, "running inside a user namespace; capabilities there do not grant BPF")
@@ -82,7 +86,7 @@ pub(super) fn container(check: &Shared, env: &dyn Env, tool: &Tool) -> Diagnosti
         Some(evidence) => check
             .diag(Status::Info, format!("running in a container ({evidence})"))
             .with_fix(Fix::new(
-                CONTAINER_RECIPE,
+                container_recipe(tool.required_caps),
                 format!("the privileges and mounts {} needs", tool.name),
             )),
     }
@@ -98,10 +102,11 @@ pub(super) fn seccomp(check: &Shared, env: &dyn Env, tool: &Tool) -> Diagnostic 
     if mode == "0" {
         return check.diag(Status::Pass, "no seccomp filter");
     }
-    // Only with capabilities in effect does EPERM point at the filter.
+    // Only with capabilities in effect does EPERM point at the filter, and not
+    // inside a user namespace, where bpf() refuses them anyway (env.userns).
     if privileged(env, tool) {
         match env.bpf_probe(BpfProbe::RingBuf) {
-            Err(libc::EPERM) => {
+            Err(libc::EPERM) if initial_userns(env) == Some(true) => {
                 return check
                     .diag(
                         Status::Fail,

@@ -42,6 +42,7 @@ pub struct SystemdUnit {
 
 /// Which systemd instance manages a unit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Manager {
     /// PID 1.
     System,
@@ -81,6 +82,7 @@ impl fmt::Display for Container {
 
 /// Container runtimes recognised from cgroup paths.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Runtime {
     /// `docker-<id>.scope` (systemd driver) or `/docker/<id>` (cgroupfs driver).
     Docker,
@@ -152,11 +154,13 @@ pub fn parse_container(path: &str) -> Option<Container> {
     found
 }
 
-/// Extracts the cgroup v2 path (the `0::` line) from `/proc/<pid>/cgroup`.
+/// Extracts the cgroup v2 path (the `0::` line) from `/proc/<pid>/cgroup`, without
+/// the ` (deleted)` the kernel appends once the cgroup has been removed.
 pub(crate) fn cgroup_v2_path(contents: &[u8]) -> Option<&[u8]> {
     contents
         .split(|&b| b == b'\n')
         .find_map(|line| line.strip_prefix(b"0::"))
+        .map(|path| path.strip_suffix(b" (deleted)").unwrap_or(path))
         .filter(|path| !path.is_empty())
 }
 
@@ -451,5 +455,14 @@ mod tests {
         assert_eq!(cgroup_v2_path(b"0::\n"), None);
         // Paths may contain colons.
         assert_eq!(cgroup_v2_path(b"0::/a:b\n"), Some(&b"/a:b"[..]));
+    }
+
+    #[test]
+    fn removed_cgroup_loses_the_deleted_marker() {
+        let zombie = format!("0::/system.slice/docker-{HEX}.scope (deleted)\n");
+        let path = cgroup_v2_path(zombie.as_bytes()).unwrap();
+        assert_eq!(path, format!("/system.slice/docker-{HEX}.scope").as_bytes());
+        let path = std::str::from_utf8(path).unwrap();
+        assert_eq!(parse_container(path), container(Runtime::Docker, HEX));
     }
 }

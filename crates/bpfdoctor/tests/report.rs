@@ -2,7 +2,10 @@
 
 mod common;
 
-use bpfdoctor::{Check, Diagnostic, Doctor, Env, Fix, Report, Status, Tool, Uname, ids_for_errno};
+use bpfdoctor::{
+    BpfProbe, CapSets, Check, Diagnostic, Doctor, Env, Fix, Ids, Report, Status, Tool, Uname,
+    ids_for_errno,
+};
 use common::{host, tool};
 
 fn uname() -> Uname {
@@ -140,9 +143,9 @@ fn human_rendering_notes_counts_and_colour() {
     let mut plain = Vec::new();
     report.render_human(&mut plain, false).unwrap();
     let plain = String::from_utf8(plain).unwrap();
-    assert!(
-        plain.contains("\n      fix:    sudo sysctl -w net.core.bpf_jit_enable=1  # persist it\n")
-    );
+    assert!(plain.contains(
+        "\n      fix:    sudo sysctl -w net.core.bpf_jit_enable=1\n      note:   persist it\n"
+    ));
     assert!(plain.ends_with(
         "summary: 0 fail · 1 warn · 0 pass · 1 info · 1 skip → whytime will run with reduced functionality\n"
     ));
@@ -154,6 +157,56 @@ fn human_rendering_notes_counts_and_colour() {
     assert!(coloured.contains("\n \x1b[33mWARN\x1b[0m sysctl.jit     observed\n"));
     assert!(coloured.contains("\n \x1b[2mINFO\x1b[0m probe.memcg"));
     assert!(coloured.contains("\n \x1b[2mSKIP\x1b[0m probe.ringbuf"));
+}
+
+#[test]
+fn human_fix_lines_hold_only_the_command() {
+    // Notes contain `;` and `'`, which would run as shell syntax if pasted along.
+    let env = host()
+        .with_ids(Ids {
+            uid: 1000,
+            euid: 1000,
+            ..Ids::default()
+        })
+        .with_caps(CapSets {
+            bounding: u64::MAX,
+            ..CapSets::default()
+        })
+        .with_uname("Linux", "5.8.0", "x86_64")
+        .with_probe(BpfProbe::MemcgAccounting, Err(libc::EINVAL))
+        .with_memlock(64 << 10, 64 << 10);
+    let report = Doctor::with_shared().run(&env, &tool());
+    let mut out = Vec::new();
+    report.render_human(&mut out, false).unwrap();
+    let out = String::from_utf8(out).unwrap();
+
+    let cmds: Vec<&str> = out
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("      fix:    ")
+                .or_else(|| line.strip_prefix("      or:     "))
+        })
+        .collect();
+    let notes: Vec<&str> = out
+        .lines()
+        .filter_map(|line| line.strip_prefix("      note:   "))
+        .collect();
+    let fixes = report.checks.iter().flat_map(|check| &check.fixes);
+    assert_eq!(
+        cmds,
+        fixes
+            .clone()
+            .map(|fix| fix.cmd.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        notes,
+        fixes
+            .map(|fix| fix.note.as_str())
+            .filter(|note| !note.is_empty())
+            .collect::<Vec<_>>()
+    );
+    assert!(notes.iter().any(|note| note.contains(';')));
 }
 
 #[test]
@@ -243,5 +296,7 @@ fn errno_mapping_targets_likely_causes() {
     assert!(ids_for_errno(libc::EPERM).contains(&"rlimit.memlock"));
     assert!(ids_for_errno(libc::EACCES).contains(&"sec.lsm"));
     assert!(ids_for_errno(libc::ENOENT).contains(&"kernel.btf"));
+    // Lockdown rejects bpf_probe_read_kernel at load time with EINVAL.
+    assert!(ids_for_errno(libc::EINVAL).contains(&"sec.lockdown"));
     assert_eq!(ids_for_errno(-libc::EPERM), ids_for_errno(libc::EPERM));
 }
